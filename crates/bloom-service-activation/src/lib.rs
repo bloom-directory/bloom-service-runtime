@@ -2,6 +2,7 @@
 
 #[cfg(any(target_os = "linux", test))]
 use std::collections::BTreeMap;
+use std::net::TcpListener;
 use std::os::{
     fd::{FromRawFd, OwnedFd},
     unix::net::UnixListener,
@@ -39,15 +40,12 @@ impl NamedActivation {
         Ok(Self { descriptors: named })
     }
 
-    fn take(&mut self, name: &str) -> Result<UnixListener, ActivationError> {
-        self.descriptors
-            .remove(name)
-            .map(UnixListener::from)
-            .ok_or_else(|| {
-                ActivationError::Rejected(format!(
-                    "activation socket {name:?} was not provided or was already consumed"
-                ))
-            })
+    fn take(&mut self, name: &str) -> Result<OwnedFd, ActivationError> {
+        self.descriptors.remove(name).ok_or_else(|| {
+            ActivationError::Rejected(format!(
+                "activation socket {name:?} was not provided or was already consumed"
+            ))
+        })
     }
 }
 
@@ -56,23 +54,36 @@ impl NamedActivation {
 /// There is deliberately no path-binding fallback. A process outside its
 /// launch manager fails closed instead of creating a weaker endpoint.
 pub fn take_unix_listener(name: &str) -> Result<UnixListener, ActivationError> {
+    let listener = UnixListener::from(take_fd(name)?);
+    listener.set_nonblocking(true)?;
+    listener.local_addr().map_err(ActivationError::Io)?;
+    Ok(listener)
+}
+
+/// Takes exactly one OS-managed TCP listener for `name`.
+pub fn take_tcp_listener(name: &str) -> Result<TcpListener, ActivationError> {
+    let listener = TcpListener::from(take_fd(name)?);
+    listener.set_nonblocking(true)?;
+    listener.local_addr().map_err(ActivationError::Io)?;
+    Ok(listener)
+}
+
+fn take_fd(name: &str) -> Result<OwnedFd, ActivationError> {
     if name.is_empty() || name.as_bytes().contains(&0) {
         return Err(ActivationError::Rejected(
             "activation socket name is invalid".into(),
         ));
     }
     #[cfg(target_os = "macos")]
-    let listener = macos::take(name)?;
+    let descriptor = macos::take(name)?;
     #[cfg(target_os = "linux")]
-    let listener = linux::take(name)?;
+    let descriptor = linux::take(name)?;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     return Err(ActivationError::Rejected(
         "this platform has no reviewed activation adapter".into(),
     ));
 
-    listener.set_nonblocking(true)?;
-    listener.local_addr().map_err(ActivationError::Io)?;
-    Ok(listener)
+    Ok(descriptor)
 }
 
 #[cfg(target_os = "macos")]
@@ -89,7 +100,7 @@ mod macos {
         ) -> libc::c_int;
     }
 
-    pub(super) fn take(name: &str) -> Result<UnixListener, ActivationError> {
+    pub(super) fn take(name: &str) -> Result<OwnedFd, ActivationError> {
         let name = CString::new(name)
             .map_err(|_| ActivationError::Rejected("activation name contains NUL".into()))?;
         let mut raw_fds: *mut libc::c_int = ptr::null_mut();
@@ -123,7 +134,7 @@ mod macos {
         unsafe { libc::free(raw_fds.cast()) };
         // SAFETY: this function takes sole ownership of the activated fd.
         let owned = unsafe { OwnedFd::from_raw_fd(descriptor) };
-        Ok(UnixListener::from(owned))
+        Ok(owned)
     }
 }
 
@@ -132,7 +143,7 @@ mod linux {
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
-    pub(super) fn take(name: &str) -> Result<UnixListener, ActivationError> {
+    pub(super) fn take(name: &str) -> Result<OwnedFd, ActivationError> {
         static ACTIVATION: OnceLock<Result<Mutex<NamedActivation>, String>> = OnceLock::new();
         let activation = ACTIVATION.get_or_init(load);
         let activation = activation
@@ -208,18 +219,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            activation
-                .take("signer-control")
-                .unwrap()
+            UnixListener::from(activation.take("signer-control").unwrap())
                 .local_addr()
                 .unwrap()
                 .as_pathname(),
             Some(control_path.as_path())
         );
         assert_eq!(
-            activation
-                .take("signer")
-                .unwrap()
+            UnixListener::from(activation.take("signer").unwrap())
                 .local_addr()
                 .unwrap()
                 .as_pathname(),
