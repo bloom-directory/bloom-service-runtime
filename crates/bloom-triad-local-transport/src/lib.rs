@@ -4,6 +4,7 @@
 #![cfg(unix)]
 
 use std::{
+    collections::VecDeque,
     fs,
     os::unix::fs::MetadataExt,
     path::Path,
@@ -13,10 +14,11 @@ use std::{
 
 use bloom_triad_protocol::{
     AuthenticatedPeer, Base64UrlBytes, BootEpoch, BrokerSignerRequest, BrokerSignerResponse,
-    BrokerSignerService, DecimalU64, Digest32, EnvelopeKind, HelloChallenge, MachineBrokerRequest,
-    MachineBrokerResponse, MachineBrokerService, OperationId, ProtocolError, ProtocolErrorCode,
-    ProtocolVersion, RPC_ENVELOPE_SCHEMA_V1, SignedEnvelope, Token, TypedRequestMethod,
-    UnsignedEnvelope, decode_frame, encode_frame,
+    BrokerSignerService, ControlRequest, ControlResponse, DecimalU64, Digest32, EnvelopeKind,
+    HelloChallenge, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, OperationId,
+    ProtocolError, ProtocolErrorCode, ProtocolVersion, RPC_ENVELOPE_SCHEMA_V1,
+    RevocationControlService, SignedEnvelope, Token, TypedRequestMethod, UnsignedEnvelope,
+    decode_frame, encode_frame,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
@@ -25,10 +27,135 @@ use sha2::{Digest as _, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 
 const HELLO_DOMAIN: &[u8] = b"bloom-local-hello/v1";
 const FRAME_MAX_BYTES: usize = 1024 * 1024;
+
+pub struct EndpointQuota {
+    mutation_slots: Arc<Semaphore>,
+    request_rate: std::sync::Mutex<SlidingAdmission>,
+    journal_rate: std::sync::Mutex<SlidingAdmission>,
+}
+
+struct SlidingAdmission {
+    maximum: usize,
+    window_ms: u64,
+    accepted_at_ms: VecDeque<u64>,
+}
+
+#[derive(Debug)]
+pub struct EndpointAdmission {
+    _mutation_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl EndpointQuota {
+    pub fn new(
+        maximum_in_flight_mutations: usize,
+        maximum_requests_per_window: usize,
+        request_window_ms: u64,
+        maximum_journal_admissions_per_window: usize,
+        journal_window_ms: u64,
+    ) -> Result<Self, ProtocolError> {
+        if maximum_in_flight_mutations == 0
+            || maximum_requests_per_window == 0
+            || request_window_ms == 0
+            || maximum_journal_admissions_per_window == 0
+            || journal_window_ms == 0
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "endpoint quota values must be nonzero",
+            ));
+        }
+        Ok(Self {
+            mutation_slots: Arc::new(Semaphore::new(maximum_in_flight_mutations)),
+            request_rate: std::sync::Mutex::new(SlidingAdmission {
+                maximum: maximum_requests_per_window,
+                window_ms: request_window_ms,
+                accepted_at_ms: VecDeque::new(),
+            }),
+            journal_rate: std::sync::Mutex::new(SlidingAdmission {
+                maximum: maximum_journal_admissions_per_window,
+                window_ms: journal_window_ms,
+                accepted_at_ms: VecDeque::new(),
+            }),
+        })
+    }
+
+    pub fn admit(
+        &self,
+        method: &Token,
+        observed_at_ms: u64,
+    ) -> Result<EndpointAdmission, ProtocolError> {
+        self.request_rate
+            .lock()
+            .map_err(|_| unavailable("request rate gate poisoned".into()))?
+            .admit(observed_at_ms, "request rate quota exhausted")?;
+        if is_read_method(method.as_str()) {
+            return Ok(EndpointAdmission {
+                _mutation_permit: None,
+            });
+        }
+        let permit = self
+            .mutation_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                ProtocolError::new(
+                    ProtocolErrorCode::QuotaExceeded,
+                    "concurrent mutation quota exhausted",
+                )
+            })?;
+        self.journal_rate
+            .lock()
+            .map_err(|_| unavailable("journal admission gate poisoned".into()))?
+            .admit(
+                observed_at_ms,
+                "operation journal admission quota exhausted",
+            )?;
+        Ok(EndpointAdmission {
+            _mutation_permit: Some(permit),
+        })
+    }
+}
+
+impl SlidingAdmission {
+    fn admit(&mut self, now_ms: u64, message: &str) -> Result<(), ProtocolError> {
+        while self
+            .accepted_at_ms
+            .front()
+            .is_some_and(|accepted| accepted.saturating_add(self.window_ms) <= now_ms)
+        {
+            self.accepted_at_ms.pop_front();
+        }
+        if self.accepted_at_ms.len() >= self.maximum {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::QuotaExceeded,
+                message,
+            ));
+        }
+        self.accepted_at_ms.push_back(now_ms);
+        Ok(())
+    }
+}
+
+fn is_read_method(method: &str) -> bool {
+    method.ends_with(".read")
+        || method.ends_with(".readiness")
+        || method.ends_with(".capabilities")
+        || method.ends_with(".status")
+        || method.ends_with(".list")
+        || method.ends_with(".list_public")
+        || method.ends_with(".get_public")
+        || method == "revocation.state"
+        || method == "sealed_approval.limit_state"
+        || method == "key.derivation_capabilities"
+        || method == "key.list_derived"
+        || method == "credential.list_public"
+        || method == "custody.result"
+}
 
 #[derive(Clone)]
 pub struct LocalIdentity {
@@ -54,6 +181,7 @@ pub struct EdgeManifest {
     pub machine: ManifestPeer,
     pub broker: ManifestPeer,
     pub signer: ManifestPeer,
+    pub revoke_client: ManifestPeer,
 }
 
 #[derive(Clone, Deserialize)]
@@ -365,10 +493,24 @@ pub async fn dispatch_machine_broker_connection(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
     machine: &PeerAcl,
+    quota: &EndpointQuota,
     service: &dyn MachineBrokerService,
 ) -> Result<(), ProtocolError> {
     let request = receive_request::<MachineBrokerRequest>(stream, identity, machine).await?;
+    let admission = match quota.admit(&request.unsigned.method, now_ms()?) {
+        Ok(admission) => admission,
+        Err(error) => {
+            return send_response::<_, MachineBrokerResponse>(
+                stream,
+                identity,
+                &request,
+                Err(error),
+            )
+            .await;
+        }
+    };
     let result = service.dispatch(request.unsigned.body.clone()).await;
+    drop(admission);
     send_response::<_, MachineBrokerResponse>(stream, identity, &request, result).await
 }
 
@@ -376,11 +518,45 @@ pub async fn dispatch_broker_signer_connection(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
     broker: &PeerAcl,
+    quota: &EndpointQuota,
     service: &dyn BrokerSignerService,
 ) -> Result<(), ProtocolError> {
     let request = receive_request::<BrokerSignerRequest>(stream, identity, broker).await?;
+    let admission = match quota.admit(&request.unsigned.method, now_ms()?) {
+        Ok(admission) => admission,
+        Err(error) => {
+            return send_response::<_, BrokerSignerResponse>(
+                stream,
+                identity,
+                &request,
+                Err(error),
+            )
+            .await;
+        }
+    };
     let result = service.dispatch(request.unsigned.body.clone()).await;
+    drop(admission);
     send_response::<_, BrokerSignerResponse>(stream, identity, &request, result).await
+}
+
+pub async fn dispatch_control_connection(
+    stream: &mut UnixStream,
+    identity: &LocalIdentity,
+    revoke_client: &PeerAcl,
+    quota: &EndpointQuota,
+    service: &dyn RevocationControlService,
+) -> Result<(), ProtocolError> {
+    let request = receive_request::<ControlRequest>(stream, identity, revoke_client).await?;
+    let admission = match quota.admit(&request.unsigned.method, now_ms()?) {
+        Ok(admission) => admission,
+        Err(error) => {
+            return send_response::<_, ControlResponse>(stream, identity, &request, Err(error))
+                .await;
+        }
+    };
+    let result = service.dispatch(request.unsigned.body.clone()).await;
+    drop(admission);
+    send_response::<_, ControlResponse>(stream, identity, &request, result).await
 }
 
 pub async fn write_frame<T: Serialize>(
@@ -688,5 +864,58 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
         drop(client);
+    }
+
+    #[test]
+    fn read_status_remains_available_while_mutation_quota_is_exhausted() {
+        let quota = EndpointQuota::new(1, 10, 1_000, 10, 1_000).unwrap();
+        let mutation = quota
+            .admit(&Token::new("signer.sign").unwrap(), 100)
+            .unwrap();
+        assert_eq!(
+            quota
+                .admit(&Token::new("signer.sign").unwrap(), 101)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::QuotaExceeded
+        );
+        quota
+            .admit(&Token::new("operation.status").unwrap(), 102)
+            .unwrap();
+        drop(mutation);
+        quota
+            .admit(&Token::new("signer.sign").unwrap(), 103)
+            .unwrap();
+    }
+
+    #[test]
+    fn endpoint_request_and_journal_windows_fail_closed_independently() {
+        let request_limited = EndpointQuota::new(2, 1, 100, 10, 100).unwrap();
+        request_limited
+            .admit(&Token::new("operation.status").unwrap(), 10)
+            .unwrap();
+        assert_eq!(
+            request_limited
+                .admit(&Token::new("operation.status").unwrap(), 11)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::QuotaExceeded
+        );
+        request_limited
+            .admit(&Token::new("operation.status").unwrap(), 110)
+            .unwrap();
+
+        let journal_limited = EndpointQuota::new(2, 10, 100, 1, 100).unwrap();
+        let first = journal_limited
+            .admit(&Token::new("signer.sign").unwrap(), 20)
+            .unwrap();
+        drop(first);
+        assert_eq!(
+            journal_limited
+                .admit(&Token::new("signer.sign").unwrap(), 21)
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::QuotaExceeded
+        );
     }
 }
