@@ -124,6 +124,13 @@ pub trait TypedRequestMethod: Serialize {
             })?;
         Token::new(method)
     }
+
+    /// Returns the stable domain operation ID when the typed request carries
+    /// one directly. Read-only requests without an operation receive a fresh
+    /// transport correlation ID from the caller.
+    fn operation_id(&self) -> Result<Option<OperationId>, ProtocolError> {
+        Ok(None)
+    }
 }
 
 impl<T: Serialize> SignedEnvelope<T> {
@@ -156,7 +163,9 @@ impl<T: Serialize> SignedEnvelope<T> {
                 "envelope deadline must be after sent_at",
             ));
         }
-        if self.unsigned.request_digest != self.unsigned.expected_request_digest()? {
+        if self.unsigned.kind == EnvelopeKind::Request
+            && self.unsigned.request_digest != self.unsigned.expected_request_digest()?
+        {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "request digest does not match canonical body",
@@ -188,6 +197,28 @@ impl<T: Serialize> SignedEnvelope<T> {
                 )
             })
     }
+
+    /// Verifies a response and binds it to the exact authenticated request.
+    pub fn verify_response_to<U: Serialize>(
+        &self,
+        observed_effective_uid: u32,
+        expected: &AuthenticatedPeer,
+        request: &SignedEnvelope<U>,
+    ) -> Result<(), ProtocolError> {
+        self.verify(observed_effective_uid, expected)?;
+        if self.unsigned.kind != EnvelopeKind::Response
+            || request.unsigned.kind != EnvelopeKind::Request
+            || self.unsigned.method != request.unsigned.method
+            || self.unsigned.operation_id != request.unsigned.operation_id
+            || self.unsigned.request_digest != request.unsigned.request_digest
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "response does not correlate to the authenticated request",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl<T: Serialize + TypedRequestMethod> SignedEnvelope<T> {
@@ -199,10 +230,27 @@ impl<T: Serialize + TypedRequestMethod> SignedEnvelope<T> {
         expected: &AuthenticatedPeer,
     ) -> Result<(), ProtocolError> {
         self.verify(observed_effective_uid, expected)?;
+        if self.unsigned.kind != EnvelopeKind::Request {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::MalformedFrame,
+                "typed request verifier received a response envelope",
+            ));
+        }
         if self.unsigned.method != self.unsigned.body.method()? {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::MalformedFrame,
                 "authenticated envelope method does not match typed request method",
+            ));
+        }
+        if self
+            .unsigned
+            .body
+            .operation_id()?
+            .is_some_and(|body_id| body_id != self.unsigned.operation_id)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::OperationIdConflict,
+                "authenticated envelope operation ID does not match typed request body",
             ));
         }
         Ok(())
@@ -213,6 +261,20 @@ impl<T: Serialize + TypedRequestMethod> SignedEnvelope<T> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[derive(Serialize)]
+    #[serde(tag = "method", content = "body")]
+    enum OperationRequestFixture {
+        #[serde(rename = "test.mutate")]
+        Mutate { operation_id: OperationId },
+    }
+
+    impl TypedRequestMethod for OperationRequestFixture {
+        fn operation_id(&self) -> Result<Option<OperationId>, ProtocolError> {
+            let Self::Mutate { operation_id } = self;
+            Ok(Some(operation_id.clone()))
+        }
+    }
 
     fn signed() -> (SignedEnvelope<String>, AuthenticatedPeer) {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
@@ -247,6 +309,60 @@ mod tests {
             application_public_key: signing_key.verifying_key().to_bytes(),
         };
         (envelope, peer)
+    }
+
+    #[test]
+    fn typed_transport_operation_uses_the_stable_body_operation() {
+        let operation_id = OperationId::from_bytes([44; 32]);
+        let request = OperationRequestFixture::Mutate {
+            operation_id: operation_id.clone(),
+        };
+        assert_eq!(request.operation_id().unwrap(), Some(operation_id));
+    }
+
+    #[test]
+    fn typed_verifier_rejects_outer_and_body_operation_mismatch() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let body = OperationRequestFixture::Mutate {
+            operation_id: OperationId::from_bytes([44; 32]),
+        };
+        let unsigned = UnsignedEnvelope {
+            protocol: ProtocolVersion::CURRENT,
+            schema: Token::new(RPC_ENVELOPE_SCHEMA_V1).unwrap(),
+            kind: EnvelopeKind::Request,
+            method: body.method().unwrap(),
+            operation_id: OperationId::from_bytes([45; 32]),
+            request_digest: Digest32::from_bytes(
+                Sha256::digest(serde_jcs::to_vec(&body).unwrap()).into(),
+            ),
+            caller_service_id: Token::new("bloom-machine").unwrap(),
+            caller_boot_epoch: BootEpoch::from_bytes([2; 16]),
+            audience: Token::new("bloom-broker").unwrap(),
+            sent_at_ms: DecimalU64::new(10),
+            deadline_ms: DecimalU64::new(20),
+            body,
+            application_key_id: Token::new("machine-app").unwrap(),
+        };
+        let envelope = SignedEnvelope {
+            signature: Base64UrlBytes::from_bytes(
+                &signing_key
+                    .sign(&unsigned.canonical_bytes().unwrap())
+                    .to_bytes(),
+            ),
+            unsigned,
+        };
+        let expected = AuthenticatedPeer {
+            effective_uid: 501,
+            service_id: Token::new("bloom-machine").unwrap(),
+            boot_epoch: BootEpoch::from_bytes([2; 16]),
+            audience: Token::new("bloom-broker").unwrap(),
+            application_key_id: Token::new("machine-app").unwrap(),
+            application_public_key: signing_key.verifying_key().to_bytes(),
+        };
+        assert_eq!(
+            envelope.verify_typed(501, &expected).unwrap_err().code,
+            ProtocolErrorCode::OperationIdConflict
+        );
     }
 
     #[test]
