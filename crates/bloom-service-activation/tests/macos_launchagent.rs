@@ -92,7 +92,7 @@ fn macos_packaging_pins_the_platform_managed_time_source() {
 }
 
 #[test]
-fn macos_audit_checkpoint_roots_are_packaging_selected_per_principal() {
+fn macos_audit_checkpoint_roots_require_a_proven_sandbox_boundary() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -110,6 +110,7 @@ fn macos_audit_checkpoint_roots_are_packaging_selected_per_principal() {
     }
     let readme = fs::read_to_string(workspace.join("packaging/triad/macos/README.md")).unwrap();
     assert!(readme.contains("audit checkpoint"));
-    assert!(readme.contains("service principal"));
-    assert!(readme.contains("Machine and Broker cannot read the Signer"));
+    assert!(readme.contains("not itself a principal boundary"));
+    assert!(readme.contains("signed App Sandbox entitlements"));
+    assert!(readme.contains("negative-access evidence"));
 }
