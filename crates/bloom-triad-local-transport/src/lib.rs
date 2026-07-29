@@ -812,6 +812,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrong_effective_uid_fails_before_application_authentication() {
+        let (mut machine_stream, mut broker_stream) = UnixStream::pair().unwrap();
+        let observed_uid = machine_stream.peer_cred().unwrap().uid();
+        let wrong_uid = observed_uid.checked_add(1).unwrap_or_else(|| {
+            observed_uid
+                .checked_sub(1)
+                .expect("a uid has an adjacent representable value")
+        });
+        let machine = identity("bloom-machine", 1);
+        let broker = identity("bloom-broker", 2);
+        let machine_acl = acl(&machine, wrong_uid);
+        let broker_acl = acl(&broker, wrong_uid);
+
+        let (client, server) = tokio::join!(
+            authenticate_client(&mut machine_stream, &machine, &broker_acl),
+            authenticate_server(&mut broker_stream, &broker, &machine_acl)
+        );
+        assert_eq!(
+            client.unwrap_err().code,
+            ProtocolErrorCode::UnauthenticatedPeer
+        );
+        assert_eq!(
+            server.unwrap_err().code,
+            ProtocolErrorCode::UnauthenticatedPeer
+        );
+    }
+
+    #[tokio::test]
     async fn machine_cannot_authenticate_to_signer_endpoint() {
         let (mut machine_stream, mut signer_stream) = UnixStream::pair().unwrap();
         let uid = machine_stream.peer_cred().unwrap().uid();
