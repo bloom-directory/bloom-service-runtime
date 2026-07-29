@@ -170,3 +170,22 @@ fn service_sandboxes_remove_machine_and_network_authority() {
         "AWS profile must not permit wildcard egress"
     );
 }
+
+#[test]
+fn linux_time_policy_requires_multiple_authenticated_sources() {
+    let chrony = source("chrony/bloom-nts.conf.in");
+    assert!(chrony.contains("authselectmode require"));
+    assert!(chrony.contains("minsources 2"));
+    assert_eq!(
+        chrony.lines().filter(|line| line.contains(" nts")).count(),
+        2,
+        "packaging must render at least two authenticated NTS sources"
+    );
+    assert!(
+        !chrony.lines().any(|line| {
+            let line = line.trim_start();
+            (line.starts_with("server ") || line.starts_with("pool ")) && !line.contains(" nts")
+        }),
+        "unauthenticated selectable time source is forbidden"
+    );
+}

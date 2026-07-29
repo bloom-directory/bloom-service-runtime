@@ -78,3 +78,15 @@ fn sandbox_groups_form_only_the_two_authorized_edges() {
         "local Signer must have no network entitlement"
     );
 }
+
+#[test]
+fn macos_packaging_pins_the_platform_managed_time_source() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("service activation crate is inside the workspace");
+    let readme = fs::read_to_string(workspace.join("packaging/triad/macos/README.md")).unwrap();
+    assert!(readme.contains("trusted_time_source"));
+    assert!(readme.contains("macos-managed-timed"));
+    assert!(readme.contains("Peer-supplied time"));
+}

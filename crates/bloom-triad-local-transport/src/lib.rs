@@ -178,6 +178,7 @@ pub struct PeerAcl {
 #[serde(deny_unknown_fields)]
 pub struct EdgeManifest {
     pub schema: String,
+    pub trusted_time_source: String,
     pub machine: ManifestPeer,
     pub broker: ManifestPeer,
     pub signer: ManifestPeer,
@@ -235,6 +236,13 @@ pub fn load_identity_and_manifest(
             "unsupported edge manifest schema",
         ));
     }
+    bloom_trusted_time::TrustedTimeSource::for_current_platform(&manifest.trusted_time_source)
+        .map_err(|error| {
+            ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                format!("edge manifest trusted time source is invalid: {error}"),
+            )
+        })?;
     let identity = identity_file.into_identity()?;
     if identity.service_id.as_str() != expected_service_id {
         return Err(unauthenticated(
