@@ -189,3 +189,19 @@ fn linux_time_policy_requires_multiple_authenticated_sources() {
         "unauthenticated selectable time source is forbidden"
     );
 }
+
+#[test]
+fn audit_checkpoint_roots_are_principal_private_and_explicitly_wired() {
+    let temporary_paths = source("tmpfiles.d/bloom-login.conf.in");
+    for principal in ["broker", "signer"] {
+        let checkpoint = format!("/var/lib/bloom/@LOGIN_UID@/{principal}/audit-checkpoints");
+        assert!(temporary_paths.contains(&format!(
+            "d {checkpoint} 0700 bloom-{principal}-@LOGIN_UID@ bloom-{principal}-@LOGIN_UID@"
+        )));
+        let service = source(&format!("systemd/bloom-{principal}@.service.in"));
+        assert!(service.contains(&format!(
+            "Environment=BLOOM_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/{principal}/audit-checkpoints"
+        )));
+        assert!(!service.contains("../"));
+    }
+}

@@ -90,3 +90,26 @@ fn macos_packaging_pins_the_platform_managed_time_source() {
     assert!(readme.contains("macos-managed-timed"));
     assert!(readme.contains("Peer-supplied time"));
 }
+
+#[test]
+fn macos_audit_checkpoint_roots_are_packaging_selected_per_principal() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("service activation crate is inside the workspace");
+    for (principal, placeholder) in [
+        ("broker", "@BLOOM_BROKER_AUDIT_CHECKPOINT_DIR@"),
+        ("signer", "@BLOOM_SIGNER_AUDIT_CHECKPOINT_DIR@"),
+    ] {
+        let launch_agent = fs::read_to_string(workspace.join(format!(
+            "packaging/triad/macos/launchagents/com.bloom.{principal}.plist.in"
+        )))
+        .unwrap();
+        assert!(launch_agent.contains("<key>BLOOM_AUDIT_CHECKPOINT_DIR</key>"));
+        assert!(launch_agent.contains(placeholder));
+    }
+    let readme = fs::read_to_string(workspace.join("packaging/triad/macos/README.md")).unwrap();
+    assert!(readme.contains("audit checkpoint"));
+    assert!(readme.contains("service principal"));
+    assert!(readme.contains("Machine and Broker cannot read the Signer"));
+}
