@@ -477,4 +477,12 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     let workflow =
         fs::read_to_string(workspace().join(".github/workflows/macos-unix-w0.yml")).unwrap();
     assert!(workflow.contains("workflow_call:"));
+
+    let two_login_workflow =
+        fs::read_to_string(workspace().join(".github/workflows/macos-two-login-w0.yml")).unwrap();
+    assert!(two_login_workflow.contains("bloom-two-login-disposable"));
+    assert!(two_login_workflow.contains("test \"$(id -u)\" !="));
+    assert!(two_login_workflow.contains("failing-broker.c"));
+    assert!(two_login_workflow.contains("run-two-login.sh"));
+    assert!(two_login_workflow.contains("macos-two-login-evidence/*.pass"));
 }
