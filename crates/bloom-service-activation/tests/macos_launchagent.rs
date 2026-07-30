@@ -11,6 +11,16 @@ fn workspace() -> PathBuf {
         .to_path_buf()
 }
 
+fn assert_ordered(source: &str, needles: &[&str]) {
+    let mut offset = 0;
+    for needle in needles {
+        let position = source[offset..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing ordered source fragment {needle}"));
+        offset += position + needle.len();
+    }
+}
+
 #[test]
 fn broker_launchdaemon_uses_distinct_uid_gid_sockets_and_direct_ceremony_bind() {
     let source = fs::read_to_string(
@@ -205,6 +215,9 @@ fn macos_upgrade_is_global_journaled_and_health_checked() {
         "installed enrollments do not share one complete release",
         "stop_upgrade_jobs",
         "restore_upgrade_files",
+        "health_check_upgrade_brokers_sequentially",
+        "active_session_uids",
+        "launchctl bootstrap system \"$broker_plist\"",
         "--triad-health-check",
         "install_immutable_release",
         "bloom.macos-enrollment-transaction.1",
@@ -222,6 +235,58 @@ fn macos_upgrade_is_global_journaled_and_health_checked() {
     assert!(!source.contains(
         "macOS atomic release upgrade is not enabled until rollback health checks are implemented"
     ));
+
+    let sequential = source
+        .split("health_check_upgrade_brokers_sequentially() {")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n\nrestore_upgrade_files()")
+        .next()
+        .unwrap();
+    assert_ordered(
+        sequential,
+        &[
+            "active_session_uids",
+            "launchctl bootstrap system \"$broker_plist\"",
+            "--triad-health-check",
+            "launchctl bootout \"system/com.bloom.broker.$enrolled_uid\"",
+        ],
+    );
+
+    let activation = source
+        .split("activate_upgrade_transaction() {")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n\ninstall_immutable_release()")
+        .next()
+        .unwrap();
+    assert_ordered(
+        activation,
+        &[
+            "restore_upgrade_jobs session",
+            "restore_upgrade_jobs signer",
+            "health_check_upgrade_brokers_sequentially \"$new_digest\"",
+            "restore_upgrade_jobs broker",
+            "write_upgrade_phase committed",
+        ],
+    );
+
+    let rollback = source
+        .split("rollback_upgrade() {")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n\nrecover_interrupted_upgrade()")
+        .next()
+        .unwrap();
+    assert_ordered(
+        rollback,
+        &[
+            "restore_upgrade_jobs session",
+            "restore_upgrade_jobs signer",
+            "health_check_upgrade_brokers_sequentially \"$old_digest\"",
+            "restore_upgrade_jobs broker",
+        ],
+    );
 }
 
 #[test]
@@ -372,6 +437,9 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(two_login.contains("through failure-only KeepAlive"));
     assert!(two_login.contains("before any new Machine request"));
     assert!(two_login.contains("two_login_lifecycle"));
+    assert!(two_login.contains("failing upgrade unexpectedly committed"));
+    assert!(two_login.contains("two-login upgrade rollback split the installed release"));
+    assert!(two_login.contains("mui_09.pass"));
     assert!(two_login.contains("macos-conformance-subject.sh"));
     assert!(
         !two_login.contains("touch \"$marker\"")
@@ -384,7 +452,11 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     )
     .unwrap();
     assert!(installed_acceptance.contains("installed_ac_01_35"));
+    assert!(installed_acceptance.contains("mui_01"));
+    assert!(installed_acceptance.contains("mui_11"));
     assert!(installed_acceptance.contains("mui_12"));
+    assert!(installed_acceptance.contains("TeamIdentifier="));
+    assert!(installed_acceptance.contains("release gate emitted a production macOS claim"));
     assert!(installed_acceptance.contains("BLOOM_ACCEPTANCE_BUNDLE_ROOT"));
     assert!(installed_acceptance.contains("assert_installed_process bloom-broker"));
     assert!(installed_acceptance.contains("assert_installed_process bloom-signer"));
