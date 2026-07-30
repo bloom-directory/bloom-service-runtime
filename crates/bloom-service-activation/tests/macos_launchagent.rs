@@ -161,6 +161,32 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
 }
 
 #[test]
+fn macos_upgrade_is_global_journaled_and_health_checked() {
+    let source =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    for required in [
+        "bloom.macos-upgrade-transaction.1",
+        "recover_interrupted_upgrade",
+        "prepare_upgrade_transaction",
+        "activate_upgrade_transaction",
+        "rollback_upgrade",
+        "installed enrollments do not share one complete release",
+        "stop_upgrade_jobs",
+        "restore_upgrade_files",
+        "--triad-health-check",
+        "install_immutable_release",
+    ] {
+        assert!(
+            source.contains(required),
+            "macOS installer is missing upgrade invariant {required}"
+        );
+    }
+    assert!(!source.contains(
+        "macOS atomic release upgrade is not enabled until rollback health checks are implemented"
+    ));
+}
+
+#[test]
 fn production_macos_bundle_forbids_archived_private_identity_material() {
     for script in ["build-bundle.sh", "verify-bundle.sh"] {
         let source =

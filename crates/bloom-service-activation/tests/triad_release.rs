@@ -406,6 +406,16 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
         root.join("Library/Application Support/BloomTriad/enrollments/501.json"),
     )
     .unwrap();
+    assert_eq!(
+        fs::metadata(
+            root.join("Library/Application Support/BloomTriad/enrollments/501.json")
+        )
+        .unwrap()
+        .permissions()
+        .mode()
+            & 0o777,
+        0o644
+    );
     assert!(enrollment.contains("\"broker_gid\": 260499"));
     assert!(enrollment.contains("\"signer_gid\": 260500"));
     assert!(enrollment.contains("\"machine_broker_gid\": 260501"));
@@ -477,4 +487,31 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
             .exists(),
         "per-login uninstall must not remove the shared release"
     );
+}
+
+#[test]
+fn macos_installer_never_repairs_or_overwrites_a_digest_named_release() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let payload = make_installer_payload(directory.path());
+    let installer = release_script("install-macos.sh");
+    assert!(
+        stage_macos_install(&installer, &root, &payload)
+            .status
+            .success()
+    );
+    let installed_broker = root.join(format!(
+        "usr/local/libexec/bloom/releases/{}/bloom-broker",
+        "11".repeat(32)
+    ));
+    fs::write(&installed_broker, b"substituted").unwrap();
+
+    let rejected = stage_macos_install(&installer, &root, &payload);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("existing versioned Bloom release does not match its digest")
+    );
+    assert_eq!(fs::read(installed_broker).unwrap(), b"substituted");
 }
