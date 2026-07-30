@@ -37,9 +37,13 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "edge-manifest.json",
         "broker.json",
         "signer.json",
+        "machine-identity.json",
         "broker-identity.json",
         "signer-identity.json",
+        "revoke-identity.json",
         "session-identity.json",
+        "installer-identity.json",
+        "provenance-catalog.json",
     ] {
         fs::write(payload.join("config").join(config), b"{}").unwrap();
     }
@@ -426,6 +430,19 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
             & 0o777,
         0o700
     );
+    for relative in [
+        "machine/identity.json",
+        "machine/revoke-identity.json",
+        "installer/identity.json",
+        "provenance-catalog.json",
+    ] {
+        assert!(
+            root.join("Library/Application Support/BloomTriad/config/501")
+                .join(relative)
+                .is_file(),
+            "macOS install omitted {relative}"
+        );
+    }
 
     let signer_checkpoints = root.join("var/db/bloom/501/signer/audit-checkpoints");
     let substituted = directory.path().join("substituted-checkpoints");

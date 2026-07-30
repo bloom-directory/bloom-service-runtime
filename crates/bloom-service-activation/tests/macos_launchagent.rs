@@ -103,6 +103,10 @@ fn broker_requires_the_authenticated_session_socket_before_ceremonies() {
     assert!(machine.contains("bloom-session"));
     assert!(machine.contains("remove_owned_stale_socket"));
     assert!(machine.contains("session_socket_gid"));
+
+    let cli = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
+    assert!(cli.contains("/Library/Application Support/BloomTriad/enrollments/"));
+    assert!(cli.contains("/private/var/run/bloom/{uid}/machine-broker/broker.sock"));
 }
 
 #[test]
@@ -142,6 +146,8 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
         "verify_existing_enrollment",
         "BLOOM_RELEASE_PUBLIC_KEY",
         "pinned release key must be root-owned",
+        "--triad-render-macos-enrollment",
+        "config_source=\"$generated_material\"",
     ] {
         assert!(
             source.contains(required),
@@ -150,6 +156,29 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
     }
     assert!(!source.contains("macos-rootless-code-identity"));
     assert!(!source.contains("com.apple.security.application-groups"));
+}
+
+#[test]
+fn production_macos_bundle_forbids_archived_private_identity_material() {
+    for script in ["build-bundle.sh", "verify-bundle.sh"] {
+        let source =
+            fs::read_to_string(workspace().join("packaging/triad/release").join(script)).unwrap();
+        assert!(source.contains("production macOS bundle contains private key material"));
+        assert!(source.contains("private_key_seed_hex|signing_seed_hex"));
+        assert!(source.contains("private identity-shaped file"));
+    }
+    let templates = workspace().join("packaging/triad/macos/config");
+    for entry in fs::read_dir(templates).unwrap() {
+        let path = entry.unwrap().path();
+        let bytes = fs::read_to_string(&path).unwrap();
+        for line in bytes.lines().filter(|line| line.contains("seed_hex")) {
+            assert!(
+                line.contains('@'),
+                "{} contains a concrete private seed",
+                path.display()
+            );
+        }
+    }
 }
 
 #[test]
