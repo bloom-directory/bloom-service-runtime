@@ -203,6 +203,7 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
         "\"dsAttrTypeNative:$attribute\".0",
         "chown \"$broker_user:$machine_broker_group\" \"$runtime_root/machine-broker\"",
         "chown \"$signer_user:$broker_signer_group\" \"$runtime_root/broker-signer\"",
+        "chown root:wheel \"$runtime_root\" \"$runtime_root/containment\"",
         "$runtime_root/revoke/broker",
         "$runtime_root/revoke/signer",
     ] {
