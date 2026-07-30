@@ -327,6 +327,10 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("Signer opened a forbidden IPv6 loopback TCP connection"));
     assert!(source.contains("assert_udp_blocked"));
     assert!(source.contains("forbidden non-loopback IPv4 TCP connection"));
+    assert!(source.contains("session sentinel did not reject an unauthorized login-UID peer"));
+    assert!(source.contains("services did not drain after the login-session sentinel disappeared"));
+    assert!(source.contains("Broker retained the ceremony listener after session logout"));
+    assert!(source.contains("launchctl bootstrap \"gui/$login_uid\" \"$session_plist\""));
     assert!(
         !source.contains("touch \"$marker\"")
             && !source.contains("install -m 0600 /dev/null \"$marker\""),
