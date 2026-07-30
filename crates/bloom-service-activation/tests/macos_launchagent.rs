@@ -190,6 +190,9 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
         "BLOOM_RELEASE_PUBLIC_KEY",
         "pinned release key must be root-owned",
         "--triad-render-macos-enrollment",
+        ".enrollment-templates.XXXXXX",
+        "$payload/installer/macos/config/$public_template",
+        "\"$template_staging\"",
         "config_source=\"$generated_material\"",
         "generated_macos_enrollment",
     ] {
