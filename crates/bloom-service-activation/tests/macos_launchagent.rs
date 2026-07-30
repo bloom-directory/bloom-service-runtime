@@ -343,6 +343,8 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("unrelated local UID opened protected Unix endpoint"));
     assert!(source.contains("Machine login opened the Broker-to-Signer data endpoint"));
     assert!(source.contains("assert_principal_cannot_replace"));
+    assert!(source.contains("run_reinstall_with_substitution"));
+    assert!(source.contains("installer accepted $substitution edge-manifest tampering"));
     assert!(source.contains("task-access-probe"));
     assert!(source.contains("Machine login sampled"));
     assert!(source.contains("session sentinel did not reject an unauthorized login-UID peer"));
