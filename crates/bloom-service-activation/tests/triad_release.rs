@@ -22,7 +22,7 @@ fn make_staging(root: &Path) -> PathBuf {
     fs::create_dir_all(staging.join("bin")).unwrap();
     for binary in ["bloom", "bloom-broker", "bloom-signer"] {
         let path = staging.join("bin").join(binary);
-        let version = if binary == "bloom" { "0.1.1" } else { "0.1.0" };
+        let version = if binary == "bloom" { "0.1.3" } else { "0.1.0" };
         fs::write(&path, format!("#!/bin/sh\necho {binary} {version}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
