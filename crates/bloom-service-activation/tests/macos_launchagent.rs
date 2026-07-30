@@ -467,4 +467,14 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
             && !installed_acceptance.contains("install -m 0600 /dev/null \"$marker\""),
         "the installed-acceptance harness must not self-authorize a host as disposable"
     );
+
+    let ci = fs::read_to_string(workspace().join(".github/workflows/ci.yml")).unwrap();
+    assert!(ci.contains("macos_unix_principal_disposable_w0"));
+    assert!(ci.contains("github.event_name == 'workflow_dispatch'"));
+    assert!(ci.contains("github.ref_name == 'triad-architecture'"));
+    assert!(ci.contains("uses: ./.github/workflows/macos-unix-w0.yml"));
+
+    let workflow =
+        fs::read_to_string(workspace().join(".github/workflows/macos-unix-w0.yml")).unwrap();
+    assert!(workflow.contains("workflow_call:"));
 }
