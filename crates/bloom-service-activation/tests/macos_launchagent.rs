@@ -138,6 +138,9 @@ fn pf_source_denies_broker_and_signer_by_numeric_effective_uid() {
             .expect("read packet-filter source");
     assert!(source.contains("user @BLOOM_SIGNER_UID@"));
     assert!(source.contains("user @BLOOM_BROKER_UID@"));
+    assert!(source.contains("pass out quick on lo0 inet proto tcp"));
+    assert!(source.contains("from 127.0.0.1 port 18734 to 127.0.0.1"));
+    assert!(source.contains("flags A/A user @BLOOM_BROKER_UID@"));
     assert!(source.contains("block return out quick"));
     assert!(!source.contains("0.0.0.0/0"));
     assert!(!source.contains("::/0"));
