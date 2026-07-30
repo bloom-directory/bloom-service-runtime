@@ -180,6 +180,7 @@ fn root_pf_monitor_has_no_rpc_or_custody_surface_and_services_require_its_attest
     assert!(monitor.contains("system/com.apple.timed"));
     assert!(monitor.contains("status.json"));
     assert!(monitor.contains("restart_services_for_live_session"));
+    assert!(monitor.contains("if enrollment_state == \"active\""));
     assert!(monitor.contains("session.sock"));
     assert!(monitor.contains("metadata.file_type().is_socket()"));
     assert!(monitor.contains("system/com.bloom.{service}.{login_uid}"));
