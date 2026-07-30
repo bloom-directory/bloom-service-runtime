@@ -210,6 +210,19 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
             "a clean first install must treat absent recovery state as success"
         );
     }
+    for bash3_unsafe_empty_array in [
+        r#""${pending_transactions[@]}""#,
+        r#""${abandoned_rotation_staging[@]}""#,
+        r#""${abandoned_uninstall_staging[@]}""#,
+        r#""${transactions[@]}""#,
+        r#""${retained_records[@]}""#,
+        r#""${installed_enrollment_files[@]}""#,
+    ] {
+        assert!(
+            !source.contains(bash3_unsafe_empty_array),
+            "macOS Bash 3.2 must not expand a possibly empty array under nounset"
+        );
+    }
     assert!(!source.contains("macos-rootless-code-identity"));
     assert!(!source.contains("com.apple.security.application-groups"));
 }
