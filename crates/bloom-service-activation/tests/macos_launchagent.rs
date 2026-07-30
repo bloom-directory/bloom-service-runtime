@@ -409,6 +409,17 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
         .unwrap();
     assert!(recovery.contains("if $rotation_in_progress; then"));
     assert!(recovery.ends_with("return 0"));
+
+    assert!(source.contains("if ! $restoring_retained; then"));
+    assert_ordered(
+        &source,
+        &[
+            "cp \"$retained_record\" \"$enrollment_temporary\"",
+            "if ! $restoring_retained; then",
+            "publish_enrollment_active",
+            "require_matching_enrollment_state \"$retained_record\" \"$enrollment\" active",
+        ],
+    );
 }
 
 #[test]
