@@ -204,6 +204,10 @@ fn macos_upgrade_is_global_journaled_and_health_checked() {
         "restore_upgrade_files",
         "--triad-health-check",
         "install_immutable_release",
+        "bloom.macos-enrollment-transaction.1",
+        "recover_pending_enrollments",
+        "rollback_enrollment_transaction",
+        "publish_enrollment_active",
     ] {
         assert!(
             source.contains(required),
@@ -213,6 +217,21 @@ fn macos_upgrade_is_global_journaled_and_health_checked() {
     assert!(!source.contains(
         "macOS atomic release upgrade is not enabled until rollback health checks are implemented"
     ));
+}
+
+#[test]
+fn activating_enrollment_is_private_to_installer_health_and_session_bootstrap() {
+    let machine = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
+    assert!(machine.contains("allow_activating"));
+    assert!(machine.contains("installed Bloom enrollment is not active"));
+    let sentinel =
+        fs::read_to_string(workspace().join("crates/bloom/src/session_sentinel.rs")).unwrap();
+    assert!(sentinel.contains("Some(\"activating\" | \"active\")"));
+    let installer =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    let health = installer.find("health_check_enrollment").unwrap();
+    let publish = installer.rfind("publish_enrollment_active").unwrap();
+    assert!(health < publish);
 }
 
 #[test]

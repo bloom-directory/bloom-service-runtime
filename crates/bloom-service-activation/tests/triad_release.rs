@@ -427,6 +427,7 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
         0o644
     );
     assert!(enrollment.contains("\"broker_gid\": 260499"));
+    assert!(enrollment.contains("\"state\": \"activating\""));
     assert!(enrollment.contains("\"signer_gid\": 260500"));
     assert!(enrollment.contains("\"machine_broker_gid\": 260501"));
     assert!(enrollment.contains("\"broker_signer_gid\": 260502"));
