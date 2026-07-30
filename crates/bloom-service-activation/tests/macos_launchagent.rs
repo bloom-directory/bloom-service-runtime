@@ -30,6 +30,7 @@ fn broker_launchdaemon_selects_owned_unix_sockets_and_direct_ceremony_bind() {
 
     assert!(source.contains("<key>UserName</key>"));
     assert!(source.contains("@BLOOM_BROKER_USER@"));
+    assert!(source.contains("<key>GroupName</key>\n  <string>@BLOOM_REVOKE_GROUP@</string>"));
     assert!(source.contains("<key>InitGroups</key>\n  <true/>"));
     assert!(source.contains("<key>BLOOM_BROKER_SOCKET</key>"));
     assert!(source.contains("@BLOOM_BROKER_SOCKET@"));
@@ -64,6 +65,7 @@ fn signer_launchdaemon_exposes_only_broker_and_revoke_group_edges() {
 
     assert!(source.contains("<key>UserName</key>"));
     assert!(source.contains("@BLOOM_SIGNER_USER@"));
+    assert!(source.contains("<key>GroupName</key>\n  <string>@BLOOM_REVOKE_GROUP@</string>"));
     assert!(source.contains("<key>InitGroups</key>\n  <true/>"));
     assert!(source.contains("<key>BLOOM_SIGNER_SOCKET</key>"));
     assert!(source.contains("@BLOOM_SIGNER_SOCKET@"));
