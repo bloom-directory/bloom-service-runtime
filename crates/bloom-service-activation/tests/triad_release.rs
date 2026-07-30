@@ -122,6 +122,8 @@ fn acceptance_rerun_is_bound_to_the_verified_bundle_when_present() {
     let bundle = PathBuf::from(bundle);
     let expected_claim = if std::env::var("BLOOM_ALLOW_TEST_UNCLAIMED").as_deref() == Ok("true") {
         "test-unclaimed"
+    } else if std::env::var("BLOOM_ALLOW_MACOS_UNIX_W0").as_deref() == Ok("true") {
+        "macos-unix-principals-w0"
     } else if cfg!(target_os = "macos") {
         "macos-unix-principals"
     } else {
@@ -133,10 +135,10 @@ fn acceptance_rerun_is_bound_to_the_verified_bundle_when_present() {
             .trim(),
         expected_claim
     );
-    for (binary, version) in [
-        ("bloom", "0.1.1"),
-        ("bloom-broker", "0.1.0"),
-        ("bloom-signer", "0.1.0"),
+    for (binary, expected_version) in [
+        ("bloom", format!("bloom {}", env!("CARGO_PKG_VERSION"))),
+        ("bloom-broker", "bloom-broker 0.1.0".to_owned()),
+        ("bloom-signer", "bloom-signer 0.1.0".to_owned()),
     ] {
         let output = Command::new(bundle.join("bin").join(binary))
             .arg("--version")
@@ -145,7 +147,7 @@ fn acceptance_rerun_is_bound_to_the_verified_bundle_when_present() {
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap().trim(),
-            format!("{binary} {version}")
+            expected_version
         );
     }
 }

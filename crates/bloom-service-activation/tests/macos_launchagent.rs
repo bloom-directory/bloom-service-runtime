@@ -355,6 +355,8 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("services did not drain after the login-session sentinel disappeared"));
     assert!(source.contains("Broker retained the ceremony listener after session logout"));
     assert!(source.contains("launchctl bootstrap \"gui/$login_uid\" \"$session_plist\""));
+    assert!(source.contains("run-installed-acceptance.sh"));
+    assert!(source.contains("BLOOM_MACOS_INSTALLED_ACCEPTANCE_MAIN_ROOT"));
     assert!(
         !source.contains("touch \"$marker\"")
             && !source.contains("install -m 0600 /dev/null \"$marker\""),
@@ -375,5 +377,22 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
         !two_login.contains("touch \"$marker\"")
             && !two_login.contains("install -m 0600 /dev/null \"$marker\""),
         "the two-login harness must not self-authorize a host as disposable"
+    );
+
+    let installed_acceptance = fs::read_to_string(
+        workspace().join("packaging/triad/macos/w0/run-installed-acceptance.sh"),
+    )
+    .unwrap();
+    assert!(installed_acceptance.contains("installed_ac_01_35"));
+    assert!(installed_acceptance.contains("mui_12"));
+    assert!(installed_acceptance.contains("BLOOM_ACCEPTANCE_BUNDLE_ROOT"));
+    assert!(installed_acceptance.contains("assert_installed_process bloom-broker"));
+    assert!(installed_acceptance.contains("assert_installed_process bloom-signer"));
+    assert!(installed_acceptance.contains("-p bloom-triad-protocol"));
+    assert!(installed_acceptance.contains("--workspace"));
+    assert!(
+        !installed_acceptance.contains("touch \"$marker\"")
+            && !installed_acceptance.contains("install -m 0600 /dev/null \"$marker\""),
+        "the installed-acceptance harness must not self-authorize a host as disposable"
     );
 }
