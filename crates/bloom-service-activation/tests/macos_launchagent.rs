@@ -30,6 +30,7 @@ fn broker_launchdaemon_selects_owned_unix_sockets_and_direct_ceremony_bind() {
 
     assert!(source.contains("<key>UserName</key>"));
     assert!(source.contains("@BLOOM_BROKER_USER@"));
+    assert!(source.contains("<key>InitGroups</key>\n  <true/>"));
     assert!(source.contains("<key>BLOOM_BROKER_SOCKET</key>"));
     assert!(source.contains("@BLOOM_BROKER_SOCKET@"));
     assert!(source.contains("<key>BLOOM_BROKER_CONTROL_SOCKET</key>"));
@@ -63,6 +64,7 @@ fn signer_launchdaemon_exposes_only_broker_and_revoke_group_edges() {
 
     assert!(source.contains("<key>UserName</key>"));
     assert!(source.contains("@BLOOM_SIGNER_USER@"));
+    assert!(source.contains("<key>InitGroups</key>\n  <true/>"));
     assert!(source.contains("<key>BLOOM_SIGNER_SOCKET</key>"));
     assert!(source.contains("@BLOOM_SIGNER_SOCKET@"));
     assert!(source.contains("<key>BLOOM_SIGNER_CONTROL_SOCKET</key>"));
@@ -186,6 +188,8 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
         "\"$template_staging\"",
         "config_source=\"$generated_material\"",
         "generated_macos_enrollment",
+        "dsmemberutil flushcache",
+        "require_effective_group_member",
         "chown \"$broker_user:$machine_broker_group\" \"$runtime_root/machine-broker\"",
         "chown \"$signer_user:$broker_signer_group\" \"$runtime_root/broker-signer\"",
         "$runtime_root/revoke/broker",
