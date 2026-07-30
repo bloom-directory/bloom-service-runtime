@@ -351,6 +351,7 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
         "rollback_rotation",
         "recover_interrupted_rotation",
         "config rotation may not change",
+        "plutil -convert json -o /dev/null -- \"$new_config\"",
         "atomic_copy_preserving_metadata",
         "health_check_enrollment",
         "prepare_transport_rotation",
