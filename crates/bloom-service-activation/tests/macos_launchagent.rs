@@ -327,6 +327,11 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("Signer opened a forbidden IPv6 loopback TCP connection"));
     assert!(source.contains("assert_udp_blocked"));
     assert!(source.contains("forbidden non-loopback IPv4 TCP connection"));
+    assert!(source.contains("unrelated local UID opened protected Unix endpoint"));
+    assert!(source.contains("Machine login opened the Broker-to-Signer data endpoint"));
+    assert!(source.contains("assert_principal_cannot_replace"));
+    assert!(source.contains("task-access-probe"));
+    assert!(source.contains("Machine login sampled"));
     assert!(source.contains("session sentinel did not reject an unauthorized login-UID peer"));
     assert!(source.contains("services did not drain after the login-session sentinel disappeared"));
     assert!(source.contains("Broker retained the ceremony listener after session logout"));
