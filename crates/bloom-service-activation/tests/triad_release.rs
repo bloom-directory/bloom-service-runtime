@@ -17,6 +17,17 @@ fn release_script(name: &str) -> PathBuf {
     workspace().join("packaging/triad/release").join(name)
 }
 
+fn generate_ed25519_key(path: &Path) {
+    assert!(
+        Command::new("/usr/bin/ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
 fn make_staging(root: &Path) -> PathBuf {
     let staging = root.join("staging");
     fs::create_dir_all(staging.join("bin")).unwrap();
@@ -157,14 +168,7 @@ fn triad_bundle_is_reproducible_signed_and_self_verifying() {
     let directory = tempfile::tempdir().unwrap();
     let staging = make_staging(directory.path());
     let key = directory.path().join("release-key.pem");
-    assert!(
-        Command::new("openssl")
-            .args(["genpkey", "-algorithm", "ED25519", "-out"])
-            .arg(&key)
-            .status()
-            .unwrap()
-            .success()
-    );
+    generate_ed25519_key(&key);
     let first = directory.path().join("first.tar.gz");
     let second = directory.path().join("second.tar.gz");
     let first_build = build(&staging, &first, &key);
@@ -198,6 +202,18 @@ fn triad_bundle_is_reproducible_signed_and_self_verifying() {
         verified.status.success(),
         "{}",
         String::from_utf8_lossy(&verified.stderr)
+    );
+
+    let wrong_namespace = Command::new(release_script("ssh-ed25519-verify.sh"))
+        .arg(&public_key)
+        .arg("bloom-release-payload-v1")
+        .arg(&checksum)
+        .arg(&signature)
+        .output()
+        .unwrap();
+    assert!(
+        !wrong_namespace.status.success(),
+        "an archive signature must not verify in the payload namespace"
     );
 }
 
@@ -303,14 +319,7 @@ fn macos_production_conformance_report_is_signed_complete_and_subject_bound() {
     ] {
         fs::write(evidence.join(format!("{criterion}.pass")), &subject).unwrap();
     }
-    assert!(
-        Command::new("openssl")
-            .args(["genpkey", "-algorithm", "ED25519", "-out"])
-            .arg(&private_key)
-            .status()
-            .unwrap()
-            .success()
-    );
+    generate_ed25519_key(&private_key);
     let missing = Command::new(release_script("sign-macos-conformance-report.sh"))
         .arg(&payload)
         .arg("44".repeat(32))
@@ -382,14 +391,7 @@ fn release_scan_rejects_debug_or_accepting_artifacts() {
     )
     .unwrap();
     let key = directory.path().join("release-key.pem");
-    assert!(
-        Command::new("openssl")
-            .args(["genpkey", "-algorithm", "ED25519", "-out"])
-            .arg(&key)
-            .status()
-            .unwrap()
-            .success()
-    );
+    generate_ed25519_key(&key);
     let built = build(&staging, &directory.path().join("forbidden.tar.gz"), &key);
     assert!(!built.status.success());
     assert!(String::from_utf8_lossy(&built.stderr).contains("forbidden production artifact"));
@@ -405,14 +407,7 @@ fn bundle_rejects_a_service_outside_the_current_only_matrix() {
     )
     .unwrap();
     let key = directory.path().join("release-key.pem");
-    assert!(
-        Command::new("openssl")
-            .args(["genpkey", "-algorithm", "ED25519", "-out"])
-            .arg(&key)
-            .status()
-            .unwrap()
-            .success()
-    );
+    generate_ed25519_key(&key);
     let built = build(&staging, &directory.path().join("old-signer.tar.gz"), &key);
     assert!(!built.status.success());
     assert!(String::from_utf8_lossy(&built.stderr).contains("compatibility matrix"));
