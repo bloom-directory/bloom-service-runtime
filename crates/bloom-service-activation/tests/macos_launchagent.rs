@@ -420,6 +420,12 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
             "require_matching_enrollment_state \"$retained_record\" \"$enrollment\" active",
         ],
     );
+    assert!(source.contains("source_normalized=\"$(plutil -convert xml1 -o - \"$temporary\")\""));
+    assert!(
+        source
+            .contains("expected_normalized=\"$(plutil -convert xml1 -o - \"$expected_record\")\"")
+    );
+    assert!(source.contains("[[ \"$source_normalized\" == \"$expected_normalized\" ]]"));
 }
 
 #[test]
