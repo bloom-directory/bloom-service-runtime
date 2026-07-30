@@ -245,6 +245,27 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
 }
 
 #[test]
+fn macos_permanent_uninstall_is_forward_recoverable() {
+    let source =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    for required in [
+        "bloom.macos-uninstall-transaction.1",
+        "$uninstall_root/.new.$$",
+        "prepare_uninstall_transaction",
+        "execute_uninstall_transaction",
+        "recover_interrupted_uninstalls",
+        "state -string uninstalling",
+        "delete_directory_record_if_exact",
+        "custody state is not recoverable",
+    ] {
+        assert!(
+            source.contains(required),
+            "macOS installer is missing uninstall invariant {required}"
+        );
+    }
+}
+
+#[test]
 fn activating_enrollment_is_private_to_installer_health_and_session_bootstrap() {
     let machine = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
     assert!(machine.contains("allow_activating"));
