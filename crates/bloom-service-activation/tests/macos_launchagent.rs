@@ -107,3 +107,43 @@ fn pf_source_denies_broker_and_signer_by_numeric_effective_uid() {
     assert!(!source.contains("0.0.0.0/0"));
     assert!(!source.contains("::/0"));
 }
+
+#[test]
+fn live_installer_provisions_fail_closed_directory_service_records() {
+    let source =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    for required in [
+        "require_live_macos_root",
+        "acquire_installer_lock",
+        "next_directory_id",
+        "refusing to adopt pre-existing user",
+        "refusing to adopt pre-existing group",
+        "AuthenticationAuthority \";DisabledUser;\"",
+        "rollback_provisioning",
+        "verify_existing_enrollment",
+        "BLOOM_RELEASE_PUBLIC_KEY",
+        "pinned release key must be root-owned",
+    ] {
+        assert!(
+            source.contains(required),
+            "live installer is missing fail-closed input {required}"
+        );
+    }
+    assert!(!source.contains("macos-rootless-code-identity"));
+    assert!(!source.contains("com.apple.security.application-groups"));
+}
+
+#[test]
+fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
+    let source =
+        fs::read_to_string(workspace().join("packaging/triad/macos/w0/run-disposable.sh")).unwrap();
+    assert!(source.contains("BLOOM_RUN_MACOS_UNIX_W0"));
+    assert!(source.contains("/private/var/db/bloom-w0-disposable-host"));
+    assert!(source.contains("bloom-macos-unix-w0-disposable-v1"));
+    assert!(source.contains("macos-unix-principals-w0"));
+    assert!(
+        !source.contains("touch \"$marker\"")
+            && !source.contains("install -m 0600 /dev/null \"$marker\""),
+        "the repository must not self-authorize a host as disposable"
+    );
+}

@@ -82,6 +82,25 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         .unwrap()
 }
 
+fn stage_macos_install(installer: &Path, root: &Path, payload: &Path) -> std::process::Output {
+    Command::new(installer)
+        .args(["install"])
+        .arg(root)
+        .args(["501", "alice"])
+        .arg(payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_MACOS_BROKER_UID", "250501")
+        .env("BLOOM_MACOS_SIGNER_UID", "250502")
+        .env("BLOOM_MACOS_BROKER_GID", "260499")
+        .env("BLOOM_MACOS_SIGNER_GID", "260500")
+        .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260501")
+        .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260502")
+        .env("BLOOM_MACOS_REVOKE_GID", "260503")
+        .env("BLOOM_RELEASE_DIGEST", "11".repeat(32))
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn acceptance_rerun_is_bound_to_the_verified_bundle_when_present() {
     let Some(bundle) = std::env::var_os("BLOOM_ACCEPTANCE_BUNDLE_ROOT") else {
@@ -332,23 +351,11 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     fs::create_dir(&root).unwrap();
     let payload = make_installer_payload(directory.path());
     let installer = release_script("install-macos.sh");
-    let installed = Command::new(&installer)
-        .args(["install"])
-        .arg(&root)
-        .args(["501", "alice"])
-        .arg(&payload)
-        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
-        .env("BLOOM_MACOS_BROKER_UID", "250501")
-        .env("BLOOM_MACOS_SIGNER_UID", "250502")
-        .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260501")
-        .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260502")
-        .env("BLOOM_MACOS_REVOKE_GID", "260503")
-        .env("BLOOM_RELEASE_DIGEST", "11".repeat(32))
-        .output()
-        .unwrap();
+    let installed = stage_macos_install(&installer, &root, &payload);
     assert!(
         installed.status.success(),
-        "{}",
+        "status: {}; stderr: {}",
+        installed.status,
         String::from_utf8_lossy(&installed.stderr)
     );
     let broker_plist = root.join("Library/LaunchDaemons/com.bloom.broker.501.plist");
@@ -388,6 +395,15 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     assert!(edge_manifest.contains("\"machine_uid\": 501"));
     assert!(edge_manifest.contains("\"broker_uid\": 250501"));
     assert!(edge_manifest.contains("\"signer_uid\": 250502"));
+    let enrollment = fs::read_to_string(
+        root.join("Library/Application Support/BloomTriad/enrollments/501.json"),
+    )
+    .unwrap();
+    assert!(enrollment.contains("\"broker_gid\": 260499"));
+    assert!(enrollment.contains("\"signer_gid\": 260500"));
+    assert!(enrollment.contains("\"machine_broker_gid\": 260501"));
+    assert!(enrollment.contains("\"broker_signer_gid\": 260502"));
+    assert!(enrollment.contains("\"revoke_gid\": 260503"));
     let pf = fs::read_to_string(root.join("etc/pf.anchors/com.bloom.triad.501")).unwrap();
     assert!(pf.contains("user 250501"));
     assert!(pf.contains("user 250502"));
@@ -399,6 +415,24 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
         root.join("Library/LaunchAgents/com.bloom.session.plist")
             .exists()
     );
+
+    let signer_checkpoints = root.join("var/db/bloom/501/signer/audit-checkpoints");
+    let substituted = directory.path().join("substituted-checkpoints");
+    fs::create_dir(&substituted).unwrap();
+    fs::set_permissions(&substituted, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::remove_dir(&signer_checkpoints).unwrap();
+    std::os::unix::fs::symlink(&substituted, &signer_checkpoints).unwrap();
+    let rejected = stage_macos_install(&installer, &root, &payload);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("security directory"));
+    assert_eq!(
+        fs::metadata(&substituted).unwrap().permissions().mode() & 0o777,
+        0o777,
+        "rejected symlink substitution must not chmod the target"
+    );
+    fs::remove_file(&signer_checkpoints).unwrap();
+    fs::create_dir(&signer_checkpoints).unwrap();
+
     assert!(
         Command::new(&installer)
             .args(["uninstall"])
