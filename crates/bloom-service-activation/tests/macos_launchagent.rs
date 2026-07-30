@@ -198,6 +198,18 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
             "live installer is missing fail-closed input {required}"
         );
     }
+    for empty_recovery in [
+        r#"[[ -e "$upgrade_transaction" ]] || return 0"#,
+        r#"[[ -e "$transaction_root" ]] || return 0"#,
+        r#"[[ -e "$rotation_transaction" ]] || return 0"#,
+        r#"[[ -e "$uninstall_root" ]] || return 0"#,
+        r#"[[ -e "$retained_root" ]] || return 0"#,
+    ] {
+        assert!(
+            source.contains(empty_recovery),
+            "a clean first install must treat absent recovery state as success"
+        );
+    }
     assert!(!source.contains("macos-rootless-code-identity"));
     assert!(!source.contains("com.apple.security.application-groups"));
 }
