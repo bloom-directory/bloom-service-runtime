@@ -30,6 +30,8 @@ struct NetworkContainmentStatus {
     build_digest: Digest32,
     anchor_sha256: Digest32,
     trusted_time_source: String,
+    automatic_time_enabled: bool,
+    timed_service_loaded: bool,
     trusted_time_available: bool,
     checked_at_unix_ms: u64,
     available: bool,
@@ -103,6 +105,8 @@ fn validate_status(
         || status.login_uid != login_uid
         || &status.build_digest != build_digest
         || status.trusted_time_source != TRUSTED_TIME_SOURCE
+        || !status.automatic_time_enabled
+        || !status.timed_service_loaded
         || !status.trusted_time_available
         || !status.available
         || status.checked_at_unix_ms > now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
@@ -135,6 +139,8 @@ mod tests {
             "build_digest": "11".repeat(32),
             "anchor_sha256": "22".repeat(32),
             "trusted_time_source": trusted_time_source,
+            "automatic_time_enabled": trusted_time_available,
+            "timed_service_loaded": trusted_time_available,
             "trusted_time_available": trusted_time_available,
             "checked_at_unix_ms": checked_at_unix_ms,
             "available": available,
