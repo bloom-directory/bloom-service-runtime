@@ -181,12 +181,22 @@ fn root_pf_monitor_has_no_rpc_or_custody_surface_and_services_require_its_attest
     assert!(monitor.contains("status.json"));
     assert!(monitor.contains("restart_services_for_live_session"));
     assert!(monitor.contains("if enrollment_state == \"active\""));
+    assert!(monitor.contains("gui/{login_uid}/com.bloom.session"));
     assert!(monitor.contains("session.sock"));
     assert!(monitor.contains("metadata.file_type().is_socket()"));
     assert!(monitor.contains("system/com.bloom.{service}.{login_uid}"));
     assert!(monitor.contains("[\"signer\", \"broker\"]"));
     assert!(monitor.contains("\"kickstart\""));
     assert!(!monitor.contains("signing_seed"));
+    assert_ordered(
+        &monitor,
+        &[
+            "gui/{login_uid}/com.bloom.session",
+            "state = running",
+            "session.sock",
+            "[\"signer\", \"broker\"]",
+        ],
+    );
 
     for config in ["broker.json.in", "signer.json.in"] {
         let source = fs::read_to_string(
