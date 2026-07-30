@@ -208,6 +208,8 @@ fn macos_upgrade_is_global_journaled_and_health_checked() {
         "recover_pending_enrollments",
         "rollback_enrollment_transaction",
         "publish_enrollment_active",
+        "stale Bloom installer lock",
+        "kill -0 \"$lock_pid\"",
     ] {
         assert!(
             source.contains(required),
@@ -265,6 +267,9 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("/private/var/db/bloom-w0-disposable-host"));
     assert!(source.contains("bloom-macos-unix-w0-disposable-v1"));
     assert!(source.contains("macos-unix-principals-w0"));
+    assert!(source.contains("FAILING_UPGRADE_PAYLOAD"));
+    assert!(source.contains("kill -9 \"$interrupted_pid\""));
+    assert!(source.contains("upgrade-transaction/phase"));
     assert!(
         !source.contains("touch \"$marker\"")
             && !source.contains("install -m 0600 /dev/null \"$marker\""),
