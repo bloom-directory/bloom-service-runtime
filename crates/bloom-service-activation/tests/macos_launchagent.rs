@@ -200,6 +200,7 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
         "require_effective_group_member",
         "dscl -plist . -read",
         "\"dsAttrTypeStandard:$attribute\".0",
+        "\"dsAttrTypeNative:$attribute\".0",
         "chown \"$broker_user:$machine_broker_group\" \"$runtime_root/machine-broker\"",
         "chown \"$signer_user:$broker_signer_group\" \"$runtime_root/broker-signer\"",
         "$runtime_root/revoke/broker",
