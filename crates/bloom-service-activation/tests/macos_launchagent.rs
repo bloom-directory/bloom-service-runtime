@@ -227,6 +227,7 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
     for required in [
         "bloom.macos-config-rotation.1",
+        "bloom.macos-transport-rotation.1",
         ".rotation-transaction.new.$$",
         "verify_config_rotation",
         "prepare_rotation",
@@ -236,6 +237,9 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
         "config rotation may not change",
         "atomic_copy_preserving_metadata",
         "health_check_enrollment",
+        "prepare_transport_rotation",
+        "swap_transport_rotation_tree",
+        "--triad-render-macos-identity-rotation",
     ] {
         assert!(
             source.contains(required),
