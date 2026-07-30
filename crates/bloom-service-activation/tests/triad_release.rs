@@ -39,6 +39,7 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         "signer.json",
         "broker-identity.json",
         "signer-identity.json",
+        "session-identity.json",
     ] {
         fs::write(payload.join("config").join(config), b"{}").unwrap();
     }
@@ -47,7 +48,8 @@ fn make_installer_payload(root: &Path) -> PathBuf {
         br#"{
   "machine_uid": @LOGIN_UID@,
   "broker_uid": @BLOOM_BROKER_UID@,
-  "signer_uid": @BLOOM_SIGNER_UID@
+  "signer_uid": @BLOOM_SIGNER_UID@,
+  "session_socket_gid": @SESSION_SOCKET_GID@
 }"#,
     )
     .unwrap();
@@ -395,6 +397,7 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     assert!(edge_manifest.contains("\"machine_uid\": 501"));
     assert!(edge_manifest.contains("\"broker_uid\": 250501"));
     assert!(edge_manifest.contains("\"signer_uid\": 250502"));
+    assert!(edge_manifest.contains("\"session_socket_gid\": 260501"));
     let enrollment = fs::read_to_string(
         root.join("Library/Application Support/BloomTriad/enrollments/501.json"),
     )
@@ -414,6 +417,14 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     assert!(
         root.join("Library/LaunchAgents/com.bloom.session.plist")
             .exists()
+    );
+    assert_eq!(
+        fs::metadata(root.join("Library/Application Support/BloomTriad/config/501/session"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
     );
 
     let signer_checkpoints = root.join("var/db/bloom/501/signer/audit-checkpoints");

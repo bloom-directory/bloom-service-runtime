@@ -183,6 +183,14 @@ pub struct EdgeManifest {
     pub broker: ManifestPeer,
     pub signer: ManifestPeer,
     pub revoke_client: ManifestPeer,
+    /// macOS Unix-principal login-session identity. Older and non-macOS
+    /// manifests omit it.
+    #[serde(default)]
+    pub session: Option<ManifestPeer>,
+    /// Group owning the macOS session sentinel socket. It is kept in the
+    /// root-owned manifest so the login process never chooses an access edge.
+    #[serde(default)]
+    pub session_socket_gid: Option<u32>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -253,6 +261,10 @@ pub fn load_identity_and_manifest(
         "bloom-machine" => manifest.machine.clone(),
         "bloom-broker" => manifest.broker.clone(),
         "bloom-signer" => manifest.signer.clone(),
+        "bloom-session" => manifest
+            .session
+            .clone()
+            .ok_or_else(|| unauthenticated("edge manifest has no session identity"))?,
         _ => return Err(unauthenticated("unknown local service identity")),
     }
     .into_acl()?;

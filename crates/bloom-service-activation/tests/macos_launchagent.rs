@@ -79,11 +79,30 @@ fn session_agent_has_no_service_authority_and_stops_with_the_login_domain() {
 
     assert!(source.contains("@BLOOM_MACHINE_BINARY@"));
     assert!(source.contains("<string>--session-sentinel</string>"));
+    assert!(source.contains("BLOOM_CONFIG_ROOT"));
+    assert!(source.contains("/private/var/run/bloom"));
     assert!(source.contains("<string>Aqua</string>"));
     assert!(!source.contains("UserName"));
     assert!(!source.contains("Sockets"));
     assert!(!source.contains("BLOOM_BROKER_CONFIG"));
     assert!(!source.contains("BLOOM_SIGNER_CONFIG"));
+}
+
+#[test]
+fn broker_requires_the_authenticated_session_socket_before_ceremonies() {
+    let source = fs::read_to_string(
+        workspace().join("packaging/triad/macos/launchdaemons/com.bloom.broker.plist.in"),
+    )
+    .expect("read Broker LaunchDaemon source");
+    assert!(source.contains("<key>BLOOM_SESSION_SOCKET</key>"));
+    assert!(source.contains("@BLOOM_SESSION_SOCKET@"));
+
+    let machine = fs::read_to_string(workspace().join("crates/bloom/src/session_sentinel.rs"))
+        .expect("read Machine session sentinel");
+    assert!(machine.contains("authenticate_server"));
+    assert!(machine.contains("bloom-session"));
+    assert!(machine.contains("remove_owned_stale_socket"));
+    assert!(machine.contains("session_socket_gid"));
 }
 
 #[test]
