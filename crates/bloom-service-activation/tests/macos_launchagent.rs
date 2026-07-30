@@ -22,7 +22,7 @@ fn assert_ordered(source: &str, needles: &[&str]) {
 }
 
 #[test]
-fn broker_launchdaemon_uses_distinct_uid_gid_sockets_and_direct_ceremony_bind() {
+fn broker_launchdaemon_selects_owned_unix_sockets_and_direct_ceremony_bind() {
     let source = fs::read_to_string(
         workspace().join("packaging/triad/macos/launchdaemons/com.bloom.broker.plist.in"),
     )
@@ -30,23 +30,12 @@ fn broker_launchdaemon_uses_distinct_uid_gid_sockets_and_direct_ceremony_bind() 
 
     assert!(source.contains("<key>UserName</key>"));
     assert!(source.contains("@BLOOM_BROKER_USER@"));
-    for socket_name in ["broker", "broker-control"] {
-        assert!(
-            source.contains(&format!("<key>{socket_name}</key>")),
-            "launchd does not own {socket_name}"
-        );
-    }
-    for ownership in [
-        "@BLOOM_BROKER_UID@",
-        "@MACHINE_BROKER_GID@",
-        "@REVOKE_GID@",
-        "<integer>432</integer>",
-    ] {
-        assert!(
-            source.contains(ownership),
-            "Broker socket ownership is missing {ownership}"
-        );
-    }
+    assert!(source.contains("<key>BLOOM_BROKER_SOCKET</key>"));
+    assert!(source.contains("@BLOOM_BROKER_SOCKET@"));
+    assert!(source.contains("<key>BLOOM_BROKER_CONTROL_SOCKET</key>"));
+    assert!(source.contains("@BLOOM_BROKER_CONTROL_SOCKET@"));
+    assert!(!source.contains("<key>Sockets</key>"));
+    assert!(!source.contains("SockPath"));
     assert!(
         !source.contains("broker-ceremony")
             && !source.contains("18734")
@@ -74,12 +63,14 @@ fn signer_launchdaemon_exposes_only_broker_and_revoke_group_edges() {
 
     assert!(source.contains("<key>UserName</key>"));
     assert!(source.contains("@BLOOM_SIGNER_USER@"));
-    assert!(source.contains("@BLOOM_SIGNER_UID@"));
-    assert!(source.contains("@BROKER_SIGNER_GID@"));
-    assert!(source.contains("@REVOKE_GID@"));
+    assert!(source.contains("<key>BLOOM_SIGNER_SOCKET</key>"));
+    assert!(source.contains("@BLOOM_SIGNER_SOCKET@"));
+    assert!(source.contains("<key>BLOOM_SIGNER_CONTROL_SOCKET</key>"));
+    assert!(source.contains("@BLOOM_SIGNER_CONTROL_SOCKET@"));
     assert!(source.contains("<key>BLOOM_SESSION_SOCKET</key>"));
     assert!(source.contains("@BLOOM_SESSION_SOCKET@"));
-    assert!(!source.contains("@MACHINE_BROKER_GID@"));
+    assert!(!source.contains("<key>Sockets</key>"));
+    assert!(!source.contains("SockPath"));
     assert!(!source.contains("com.apple.security.network"));
     assert!(!source.contains("broker-ceremony"));
 }
@@ -195,6 +186,10 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
         "\"$template_staging\"",
         "config_source=\"$generated_material\"",
         "generated_macos_enrollment",
+        "chown \"$broker_user:$machine_broker_group\" \"$runtime_root/machine-broker\"",
+        "chown \"$signer_user:$broker_signer_group\" \"$runtime_root/broker-signer\"",
+        "$runtime_root/revoke/broker",
+        "$runtime_root/revoke/signer",
     ] {
         assert!(
             source.contains(required),
