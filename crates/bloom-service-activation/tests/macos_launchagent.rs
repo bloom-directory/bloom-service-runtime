@@ -314,6 +314,9 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("FAILING_UPGRADE_PAYLOAD"));
     assert!(source.contains("kill -9 \"$interrupted_pid\""));
     assert!(source.contains("upgrade-transaction/phase"));
+    assert!(source.contains("/usr/bin/nc -l 127.0.0.1 18734"));
+    assert!(source.contains("no fallback port will be used"));
+    assert!(source.contains("Broker opened a fallback TCP listener"));
     assert!(
         !source.contains("touch \"$marker\"")
             && !source.contains("install -m 0600 /dev/null \"$marker\""),
