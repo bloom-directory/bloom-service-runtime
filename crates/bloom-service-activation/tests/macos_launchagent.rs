@@ -249,7 +249,7 @@ fn macos_permanent_uninstall_is_forward_recoverable() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
     for required in [
-        "bloom.macos-uninstall-transaction.1",
+        "bloom.macos-uninstall-transaction.2",
         "$uninstall_root/.new.$$",
         "prepare_uninstall_transaction",
         "execute_uninstall_transaction",
@@ -257,6 +257,9 @@ fn macos_permanent_uninstall_is_forward_recoverable() {
         "state -string uninstalling",
         "delete_directory_record_if_exact",
         "custody state is not recoverable",
+        "retain-bloom-login-$login_uid",
+        "recover_retained_restores",
+        "must be restored with its exact signed release",
     ] {
         assert!(
             source.contains(required),
