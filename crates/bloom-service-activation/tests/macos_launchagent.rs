@@ -174,10 +174,12 @@ fn root_pf_monitor_has_no_rpc_or_custody_surface_and_services_require_its_attest
 
     let monitor = fs::read_to_string(workspace().join("crates/bloom/src/pf_monitor.rs")).unwrap();
     assert!(monitor.contains("/sbin/pfctl"));
-    assert!(monitor.contains("bloom.macos-platform-status.2"));
+    assert!(monitor.contains("bloom.macos-platform-status.3"));
     assert!(monitor.contains("/usr/sbin/systemsetup"));
     assert!(monitor.contains("Network Time: On"));
     assert!(monitor.contains("system/com.apple.timed"));
+    assert!(monitor.contains("x-bloom-ceremony-owner: bloom-broker-v1"));
+    assert!(monitor.contains("ceremony_listener_bloom_shaped"));
     assert!(monitor.contains("status.json"));
     assert!(monitor.contains("restart_services_for_live_session"));
     assert!(monitor.contains("if enrollment_state == \"active\""));

@@ -10,7 +10,7 @@ use std::{
 use bloom_triad_protocol::{Digest32, ProtocolError, ProtocolErrorCode};
 use serde::Deserialize;
 
-const STATUS_SCHEMA: &str = "bloom.macos-platform-status.2";
+const STATUS_SCHEMA: &str = "bloom.macos-platform-status.3";
 const TRUSTED_TIME_SOURCE: &str = "macos-managed-timed";
 const MAX_FUTURE_SKEW_MS: u64 = 1_000;
 
@@ -22,7 +22,7 @@ pub struct NetworkContainmentGuard {
     maximum_age_ms: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NetworkContainmentStatus {
     schema: String,
@@ -33,6 +33,7 @@ struct NetworkContainmentStatus {
     automatic_time_enabled: bool,
     timed_service_loaded: bool,
     trusted_time_available: bool,
+    ceremony_listener_bloom_shaped: bool,
     checked_at_unix_ms: u64,
     available: bool,
 }
@@ -56,6 +57,15 @@ impl NetworkContainmentGuard {
     }
 
     pub fn check(&self) -> Result<(), ProtocolError> {
+        self.read_validated_status().map(|_| ())
+    }
+
+    pub fn ceremony_listener_bloom_shaped(&self) -> Result<bool, ProtocolError> {
+        self.read_validated_status()
+            .map(|status| status.ceremony_listener_bloom_shaped)
+    }
+
+    fn read_validated_status(&self) -> Result<NetworkContainmentStatus, ProtocolError> {
         let metadata = fs::symlink_metadata(&self.path)
             .map_err(|error| unavailable(format!("inspect containment status: {error}")))?;
         if !metadata.file_type().is_file()
@@ -97,10 +107,10 @@ fn validate_status(
     build_digest: &Digest32,
     now_ms: u64,
     maximum_age_ms: u64,
-) -> Result<(), ProtocolError> {
+) -> Result<NetworkContainmentStatus, ProtocolError> {
     let status: NetworkContainmentStatus = serde_json::from_slice(bytes)
         .map_err(|error| unavailable(format!("decode containment status: {error}")))?;
-    let _anchor_digest = status.anchor_sha256;
+    let _anchor_digest = &status.anchor_sha256;
     if status.schema != STATUS_SCHEMA
         || status.login_uid != login_uid
         || &status.build_digest != build_digest
@@ -116,7 +126,7 @@ fn validate_status(
             "root packet-filter containment is unavailable or stale",
         ));
     }
-    Ok(())
+    Ok(status)
 }
 
 fn unavailable(message: impl Into<String>) -> ProtocolError {
@@ -142,6 +152,7 @@ mod tests {
             "automatic_time_enabled": trusted_time_available,
             "timed_service_loaded": trusted_time_available,
             "trusted_time_available": trusted_time_available,
+            "ceremony_listener_bloom_shaped": false,
             "checked_at_unix_ms": checked_at_unix_ms,
             "available": available,
         }))
@@ -151,7 +162,7 @@ mod tests {
     #[test]
     fn containment_status_is_exact_build_uid_available_and_fresh() {
         let digest = Digest32::new("11".repeat(32)).unwrap();
-        validate_status(
+        let validated = validate_status(
             &status(true, TRUSTED_TIME_SOURCE, true, 10_000),
             501,
             &digest,
@@ -159,6 +170,7 @@ mod tests {
             3_000,
         )
         .unwrap();
+        assert!(!validated.ceremony_listener_bloom_shaped);
         for rejected in [
             status(false, TRUSTED_TIME_SOURCE, true, 10_000),
             status(true, TRUSTED_TIME_SOURCE, false, 10_000),
