@@ -50,6 +50,8 @@ fn broker_launchdaemon_uses_distinct_uid_gid_sockets_and_direct_ceremony_bind() 
             && source.contains("<key>ThrottleInterval</key>"),
         "fatal Broker startup is not configured for throttled launchd retry"
     );
+    assert!(source.contains("<key>BLOOM_BROKER_STARTUP_STATUS</key>"));
+    assert!(source.contains("@BLOOM_BROKER_STARTUP_STATUS@"));
     assert!(source.contains("<key>Core</key>\n    <integer>0</integer>"));
 }
 
@@ -337,6 +339,8 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("/usr/bin/nc -l 127.0.0.1 18734"));
     assert!(source.contains("no fallback port will be used"));
     assert!(source.contains("Broker opened a fallback TCP listener"));
+    assert!(source.contains("foreign_or_unverifiable_process"));
+    assert!(source.contains("Bloom Broker startup failed: a foreign or unverifiable process"));
     assert!(source.contains("Signer opened a forbidden IPv6 loopback TCP connection"));
     assert!(source.contains("assert_udp_blocked"));
     assert!(source.contains("forbidden non-loopback IPv4 TCP connection"));
@@ -355,5 +359,21 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
         !source.contains("touch \"$marker\"")
             && !source.contains("install -m 0600 /dev/null \"$marker\""),
         "the repository must not self-authorize a host as disposable"
+    );
+
+    let two_login =
+        fs::read_to_string(workspace().join("packaging/triad/macos/w0/run-two-login.sh")).unwrap();
+    assert!(two_login.contains("active GUI domains for both selected users"));
+    assert!(two_login.contains("another_login_session"));
+    assert!(two_login.contains("second Broker opened a fallback TCP listener"));
+    assert!(two_login.contains("launchctl bootout \"gui/$login_uid_b\""));
+    assert!(two_login.contains("through failure-only KeepAlive"));
+    assert!(two_login.contains("before any new Machine request"));
+    assert!(two_login.contains("two_login_lifecycle"));
+    assert!(two_login.contains("macos-conformance-subject.sh"));
+    assert!(
+        !two_login.contains("touch \"$marker\"")
+            && !two_login.contains("install -m 0600 /dev/null \"$marker\""),
+        "the two-login harness must not self-authorize a host as disposable"
     );
 }
