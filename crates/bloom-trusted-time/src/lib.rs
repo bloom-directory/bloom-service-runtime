@@ -143,15 +143,12 @@ fn source_is_synchronized(source: TrustedTimeSource) -> bool {
 
 #[cfg(target_os = "macos")]
 fn source_is_synchronized(source: TrustedTimeSource) -> bool {
-    if source != TrustedTimeSource::MacosManagedTimed {
-        return false;
-    }
-    // SAFETY: a zero-mode `ntp_adjtime` call is a read-only query and does not
-    // retain the valid writable timex pointer.
-    let mut status: libc::timex = unsafe { std::mem::zeroed() };
-    // SAFETY: status remains valid for the duration of the syscall.
-    let result = unsafe { libc::ntp_adjtime(&mut status) };
-    result >= 0 && result != libc::TIME_ERROR && status.status & libc::STA_UNSYNC == 0
+    // macOS `timed` merges several reference-clock technologies and does not
+    // expose its trust state through the kernel NTP discipline queried by
+    // `ntp_adjtime`. Production services accept this wall clock only while
+    // their separate, fresh root-owned platform status attests that automatic
+    // network time is enabled and com.apple.timed is loaded.
+    source == TrustedTimeSource::MacosManagedTimed
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

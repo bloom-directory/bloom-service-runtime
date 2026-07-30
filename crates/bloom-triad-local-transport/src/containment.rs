@@ -10,7 +10,8 @@ use std::{
 use bloom_triad_protocol::{Digest32, ProtocolError, ProtocolErrorCode};
 use serde::Deserialize;
 
-const STATUS_SCHEMA: &str = "bloom.macos-network-containment.1";
+const STATUS_SCHEMA: &str = "bloom.macos-platform-status.2";
+const TRUSTED_TIME_SOURCE: &str = "macos-managed-timed";
 const MAX_FUTURE_SKEW_MS: u64 = 1_000;
 
 #[derive(Clone)]
@@ -28,6 +29,8 @@ struct NetworkContainmentStatus {
     login_uid: u32,
     build_digest: Digest32,
     anchor_sha256: Digest32,
+    trusted_time_source: String,
+    trusted_time_available: bool,
     checked_at_unix_ms: u64,
     available: bool,
 }
@@ -99,6 +102,8 @@ fn validate_status(
     if status.schema != STATUS_SCHEMA
         || status.login_uid != login_uid
         || &status.build_digest != build_digest
+        || status.trusted_time_source != TRUSTED_TIME_SOURCE
+        || !status.trusted_time_available
         || !status.available
         || status.checked_at_unix_ms > now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
         || now_ms.saturating_sub(status.checked_at_unix_ms) > maximum_age_ms
@@ -118,12 +123,19 @@ fn unavailable(message: impl Into<String>) -> ProtocolError {
 mod tests {
     use super::*;
 
-    fn status(available: bool, checked_at_unix_ms: u64) -> Vec<u8> {
+    fn status(
+        available: bool,
+        trusted_time_source: &str,
+        trusted_time_available: bool,
+        checked_at_unix_ms: u64,
+    ) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "schema": STATUS_SCHEMA,
             "login_uid": 501,
             "build_digest": "11".repeat(32),
             "anchor_sha256": "22".repeat(32),
+            "trusted_time_source": trusted_time_source,
+            "trusted_time_available": trusted_time_available,
             "checked_at_unix_ms": checked_at_unix_ms,
             "available": available,
         }))
@@ -133,11 +145,20 @@ mod tests {
     #[test]
     fn containment_status_is_exact_build_uid_available_and_fresh() {
         let digest = Digest32::new("11".repeat(32)).unwrap();
-        validate_status(&status(true, 10_000), 501, &digest, 12_000, 3_000).unwrap();
+        validate_status(
+            &status(true, TRUSTED_TIME_SOURCE, true, 10_000),
+            501,
+            &digest,
+            12_000,
+            3_000,
+        )
+        .unwrap();
         for rejected in [
-            status(false, 10_000),
-            status(true, 8_999),
-            status(true, 13_001),
+            status(false, TRUSTED_TIME_SOURCE, true, 10_000),
+            status(true, TRUSTED_TIME_SOURCE, false, 10_000),
+            status(true, "peer-supplied-time", true, 10_000),
+            status(true, TRUSTED_TIME_SOURCE, true, 8_999),
+            status(true, TRUSTED_TIME_SOURCE, true, 13_001),
         ] {
             assert_eq!(
                 validate_status(&rejected, 501, &digest, 12_000, 3_000)
@@ -146,10 +167,19 @@ mod tests {
                 ProtocolErrorCode::ServiceUnavailable
             );
         }
-        assert!(validate_status(&status(true, 10_000), 502, &digest, 12_000, 3_000).is_err());
         assert!(
             validate_status(
-                &status(true, 10_000),
+                &status(true, TRUSTED_TIME_SOURCE, true, 10_000),
+                502,
+                &digest,
+                12_000,
+                3_000
+            )
+            .is_err()
+        );
+        assert!(
+            validate_status(
+                &status(true, TRUSTED_TIME_SOURCE, true, 10_000),
                 501,
                 &Digest32::new("33".repeat(32)).unwrap(),
                 12_000,
