@@ -3,6 +3,10 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
+mod containment;
+
+pub use containment::NetworkContainmentGuard;
+
 use std::{
     collections::VecDeque,
     fs,

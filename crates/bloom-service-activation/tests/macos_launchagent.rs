@@ -134,6 +134,35 @@ fn pf_source_denies_broker_and_signer_by_numeric_effective_uid() {
 }
 
 #[test]
+fn root_pf_monitor_has_no_rpc_or_custody_surface_and_services_require_its_attestation() {
+    let plist = fs::read_to_string(
+        workspace().join("packaging/triad/macos/launchdaemons/com.bloom.containment.plist.in"),
+    )
+    .unwrap();
+    assert!(plist.contains("<string>root</string>"));
+    assert!(plist.contains("--triad-pf-monitor-once"));
+    assert!(plist.contains("<key>StartInterval</key>"));
+    assert!(!plist.contains("<key>Sockets</key>"));
+
+    let monitor = fs::read_to_string(workspace().join("crates/bloom/src/pf_monitor.rs")).unwrap();
+    assert!(monitor.contains("/sbin/pfctl"));
+    assert!(monitor.contains("bloom.macos-network-containment.1"));
+    assert!(monitor.contains("status.json"));
+    assert!(!monitor.contains("signing_seed"));
+
+    for config in ["broker.json.in", "signer.json.in"] {
+        let source = fs::read_to_string(
+            workspace()
+                .join("packaging/triad/macos/config")
+                .join(config),
+        )
+        .unwrap();
+        assert!(source.contains("\"network_containment\""));
+        assert!(source.contains("@BLOOM_CONTAINMENT_STATUS@"));
+    }
+}
+
+#[test]
 fn live_installer_provisions_fail_closed_directory_service_records() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();

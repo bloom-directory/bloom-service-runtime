@@ -386,6 +386,18 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
             );
         }
     }
+    let containment_plist = root.join("Library/LaunchDaemons/com.bloom.containment.plist");
+    let containment_source = fs::read_to_string(&containment_plist).unwrap();
+    assert!(containment_source.contains("--triad-pf-monitor-once"));
+    assert!(!containment_source.contains("@BLOOM_"));
+    assert_eq!(
+        fs::metadata(&containment_plist)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
     assert_eq!(
         fs::metadata(root.join("var/db/bloom/501/signer/audit-checkpoints"))
             .unwrap()
@@ -407,12 +419,10 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     )
     .unwrap();
     assert_eq!(
-        fs::metadata(
-            root.join("Library/Application Support/BloomTriad/enrollments/501.json")
-        )
-        .unwrap()
-        .permissions()
-        .mode()
+        fs::metadata(root.join("Library/Application Support/BloomTriad/enrollments/501.json"))
+            .unwrap()
+            .permissions()
+            .mode()
             & 0o777,
         0o644
     );
