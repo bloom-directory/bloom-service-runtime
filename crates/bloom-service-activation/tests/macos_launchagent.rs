@@ -141,6 +141,8 @@ fn installed_acceptance_derives_the_signed_release_digest_and_reads_sources_as_l
     assert!(source.contains("\"$release_digest\" == \"$payload_release_digest\""));
     assert!(source.contains("sudo -H -u \"$login_user\" /usr/bin/git -C \"$root\" rev-parse HEAD"));
     assert!(source.contains("/usr/bin/git -C \"$root\" status --porcelain --untracked-files=no"));
+    assert!(source.contains("BLOOM_MACOS_ACCEPTANCE_CARGO_TARGET_DIR"));
+    assert!(source.contains("tool_environment+=(\"CARGO_TARGET_DIR=$cargo_target_dir\")"));
     assert!(!source.contains("$payload/RELEASE_DIGEST"));
 }
 
