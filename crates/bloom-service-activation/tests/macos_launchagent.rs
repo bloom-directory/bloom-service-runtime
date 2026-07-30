@@ -132,6 +132,19 @@ fn macos_packaging_pins_platform_time_checkpoint_and_future_rootless_separation(
 }
 
 #[test]
+fn installed_acceptance_derives_the_signed_release_digest_and_reads_sources_as_login() {
+    let source = fs::read_to_string(
+        workspace().join("packaging/triad/macos/w0/run-installed-acceptance.sh"),
+    )
+    .unwrap();
+    assert!(source.contains("shasum -a 256 \"$payload/SHA256SUMS\""));
+    assert!(source.contains("\"$release_digest\" == \"$payload_release_digest\""));
+    assert!(source.contains("sudo -H -u \"$login_user\" /usr/bin/git -C \"$root\" rev-parse HEAD"));
+    assert!(source.contains("/usr/bin/git -C \"$root\" status --porcelain --untracked-files=no"));
+    assert!(!source.contains("$payload/RELEASE_DIGEST"));
+}
+
+#[test]
 fn pf_source_denies_broker_and_signer_by_numeric_effective_uid() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/macos/pf/com.bloom.login.conf.in"))
@@ -335,6 +348,16 @@ fn macos_upgrade_is_global_journaled_and_health_checked() {
             "restore_upgrade_jobs broker",
         ],
     );
+
+    let recovery = source
+        .split("recover_interrupted_upgrade() {")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n\nprepare_upgrade_transaction()")
+        .next()
+        .unwrap();
+    assert!(recovery.contains("if $upgrade_in_progress; then"));
+    assert!(recovery.ends_with("return 0"));
 }
 
 #[test]
@@ -363,6 +386,16 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
             "macOS installer is missing config-rotation invariant {required}"
         );
     }
+
+    let recovery = source
+        .split("recover_interrupted_rotation() {")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n\nrequire_same_config_field()")
+        .next()
+        .unwrap();
+    assert!(recovery.contains("if $rotation_in_progress; then"));
+    assert!(recovery.ends_with("return 0"));
 }
 
 #[test]
