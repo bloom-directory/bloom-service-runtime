@@ -179,6 +179,7 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
         "pinned release key must be root-owned",
         "--triad-render-macos-enrollment",
         "config_source=\"$generated_material\"",
+        "generated_macos_enrollment",
     ] {
         assert!(
             source.contains(required),
@@ -292,10 +293,22 @@ fn production_macos_bundle_forbids_archived_private_identity_material() {
     for script in ["build-bundle.sh", "verify-bundle.sh"] {
         let source =
             fs::read_to_string(workspace().join("packaging/triad/release").join(script)).unwrap();
-        assert!(source.contains("production macOS bundle contains private key material"));
+        assert!(source.contains("macOS Unix-principal bundle contains private key material"));
         assert!(source.contains("private_key_seed_hex|signing_seed_hex"));
         assert!(source.contains("private identity-shaped file"));
+        assert!(source.contains("verify-macos-conformance.sh"));
     }
+    let builder =
+        fs::read_to_string(workspace().join("packaging/triad/release/build-bundle.sh")).unwrap();
+    assert!(builder.contains("BLOOM_MACOS_CONFORMANCE_KEY_SHA256"));
+    assert!(builder.contains("BLOOM_MACOS_CONFORMANCE_REPORT"));
+    let verifier =
+        fs::read_to_string(workspace().join("packaging/triad/release/verify-macos-conformance.sh"))
+            .unwrap();
+    assert!(verifier.contains("bloom.macos-unix-conformance.1"));
+    assert!(verifier.contains("installed_ac_01_35"));
+    assert!(verifier.contains("two_login_lifecycle"));
+    assert!(verifier.contains("release_subject_digest"));
     let templates = workspace().join("packaging/triad/macos/config");
     for entry in fs::read_dir(templates).unwrap() {
         let path = entry.unwrap().path();

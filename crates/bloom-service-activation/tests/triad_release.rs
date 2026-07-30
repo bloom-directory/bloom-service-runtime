@@ -88,6 +88,13 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         .unwrap()
 }
 
+fn macos_subject(payload: &Path) -> std::process::Output {
+    Command::new(release_script("macos-conformance-subject.sh"))
+        .arg(payload)
+        .output()
+        .unwrap()
+}
+
 fn stage_macos_install(installer: &Path, root: &Path, payload: &Path) -> std::process::Output {
     Command::new(installer)
         .args(["install"])
@@ -113,15 +120,18 @@ fn acceptance_rerun_is_bound_to_the_verified_bundle_when_present() {
         return;
     };
     let bundle = PathBuf::from(bundle);
+    let expected_claim = if std::env::var("BLOOM_ALLOW_TEST_UNCLAIMED").as_deref() == Ok("true") {
+        "test-unclaimed"
+    } else if cfg!(target_os = "macos") {
+        "macos-unix-principals"
+    } else {
+        "linux"
+    };
     assert_eq!(
         fs::read_to_string(bundle.join("PLATFORM_CLAIM"))
             .unwrap()
             .trim(),
-        if std::env::var("BLOOM_ALLOW_TEST_UNCLAIMED").as_deref() == Ok("true") {
-            "test-unclaimed"
-        } else {
-            "linux"
-        }
+        expected_claim
     );
     for (binary, version) in [
         ("bloom", "0.1.1"),
@@ -186,6 +196,177 @@ fn triad_bundle_is_reproducible_signed_and_self_verifying() {
         verified.status.success(),
         "{}",
         String::from_utf8_lossy(&verified.stderr)
+    );
+}
+
+#[test]
+fn macos_conformance_subject_excludes_only_the_claim_and_signature_envelope() {
+    let directory = tempfile::tempdir().unwrap();
+    let payload = directory.path().join("payload");
+    fs::create_dir_all(payload.join("installer/macos")).unwrap();
+    fs::write(payload.join("bin"), b"machine-broker-signer").unwrap();
+    fs::write(payload.join("installer/macos/profile"), b"uid-boundary").unwrap();
+    fs::write(
+        payload.join("PLATFORM_CLAIM"),
+        b"macos-unix-principals-w0\n",
+    )
+    .unwrap();
+    let baseline = macos_subject(&payload);
+    assert!(
+        baseline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    let baseline = String::from_utf8(baseline.stdout).unwrap();
+
+    for (name, bytes) in [
+        ("PLATFORM_CLAIM", b"macos-unix-principals\n".as_slice()),
+        ("MACOS_CONFORMANCE_REPORT.json", b"report".as_slice()),
+        ("MACOS_CONFORMANCE_REPORT.sig", b"signature".as_slice()),
+        ("MACOS_CONFORMANCE_REPORT.pub", b"public-key".as_slice()),
+        ("RELEASE_PUBLIC_KEY.pem", b"release-key".as_slice()),
+        ("RELEASE_SIGNATURE", b"release-signature".as_slice()),
+        ("SHA256SUMS", b"release-manifest".as_slice()),
+    ] {
+        fs::write(payload.join(name), bytes).unwrap();
+    }
+    let envelope_changed = macos_subject(&payload);
+    assert!(envelope_changed.status.success());
+    assert_eq!(
+        baseline,
+        String::from_utf8(envelope_changed.stdout).unwrap()
+    );
+
+    fs::write(payload.join("installer/macos/profile"), b"changed-boundary").unwrap();
+    let security_input_changed = macos_subject(&payload);
+    assert!(security_input_changed.status.success());
+    assert_ne!(
+        baseline,
+        String::from_utf8(security_input_changed.stdout).unwrap()
+    );
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("profile", payload.join("installer/macos/substitution"))
+            .unwrap();
+        let substituted = macos_subject(&payload);
+        assert!(!substituted.status.success());
+        assert!(String::from_utf8_lossy(&substituted.stderr).contains("contains a symlink"));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_production_conformance_report_is_signed_complete_and_subject_bound() {
+    let directory = tempfile::tempdir().unwrap();
+    let payload = directory.path().join("payload");
+    fs::create_dir_all(payload.join("installer/release")).unwrap();
+    fs::write(payload.join("security-input"), b"exact-tested-content").unwrap();
+    fs::write(
+        payload.join("SOURCE_REVISIONS"),
+        b"BLOOM_BROKER_SHA=2222222\nBLOOM_MACHINE_SHA=1111111\nBLOOM_SIGNER_SHA=3333333\n",
+    )
+    .unwrap();
+    for script in [
+        "macos-conformance-subject.sh",
+        "sign-macos-conformance-report.sh",
+        "verify-macos-conformance.sh",
+    ] {
+        let destination = payload.join("installer/release").join(script);
+        fs::copy(release_script(script), &destination).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let subject = macos_subject(&payload);
+    assert!(subject.status.success());
+    let subject = String::from_utf8(subject.stdout).unwrap();
+    let private_key = directory.path().join("conformance.pem");
+    let public_key = payload.join("MACOS_CONFORMANCE_REPORT.pub");
+    let evidence = directory.path().join("evidence");
+    fs::create_dir(&evidence).unwrap();
+    for criterion in [
+        "mui_01",
+        "mui_02",
+        "mui_03",
+        "mui_04",
+        "mui_05",
+        "mui_06",
+        "mui_07",
+        "mui_08",
+        "mui_09",
+        "mui_10",
+        "mui_11",
+        "mui_12",
+        "installed_ac_01_35",
+        "negative_access",
+    ] {
+        fs::write(evidence.join(format!("{criterion}.pass")), &subject).unwrap();
+    }
+    assert!(
+        Command::new("openssl")
+            .args(["genpkey", "-algorithm", "ED25519", "-out"])
+            .arg(&private_key)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let missing = Command::new(release_script("sign-macos-conformance-report.sh"))
+        .arg(&payload)
+        .arg("44".repeat(32))
+        .args(["2026-07-30T12:00:00Z", "25G86", "arm64", "w0-test-report"])
+        .arg(&evidence)
+        .arg(&private_key)
+        .arg(&payload)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("two_login_lifecycle"));
+    fs::write(evidence.join("two_login_lifecycle.pass"), &subject).unwrap();
+    let signed = Command::new(release_script("sign-macos-conformance-report.sh"))
+        .arg(&payload)
+        .arg("44".repeat(32))
+        .args(["2026-07-30T12:00:00Z", "25G86", "arm64", "w0-test-report"])
+        .arg(&evidence)
+        .arg(&private_key)
+        .arg(&payload)
+        .output()
+        .unwrap();
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+    let key_digest = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&public_key)
+        .output()
+        .unwrap();
+    assert!(key_digest.status.success());
+    let key_digest = String::from_utf8(key_digest.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let verified = Command::new(release_script("verify-macos-conformance.sh"))
+        .arg(&payload)
+        .arg(&key_digest)
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+
+    fs::write(payload.join("security-input"), b"post-test-change").unwrap();
+    let changed = Command::new(release_script("verify-macos-conformance.sh"))
+        .arg(&payload)
+        .arg(&key_digest)
+        .output()
+        .unwrap();
+    assert!(!changed.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed.stderr).contains("does not bind this release subject")
     );
 }
 
