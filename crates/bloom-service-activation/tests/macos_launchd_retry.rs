@@ -26,10 +26,10 @@ mod macos {
     }
 
     #[test]
-    fn launchd_retries_canonical_listener_after_the_prior_owner_releases_it() {
+    fn launchd_retries_direct_bind_after_the_prior_owner_releases_it() {
         if std::env::var_os(CHILD_ENV).is_some() {
-            let listener = bloom_service_activation::take_tcp_listener("broker-ceremony")
-                .expect("launchd must hand the canonical listener to the waiting Broker");
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 18_734))
+                .expect("waiting Broker must directly acquire the canonical listener");
             assert_eq!(
                 listener.local_addr().unwrap(),
                 SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18_734).into()
@@ -70,22 +70,11 @@ mod macos {
 <dict>
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key>
-  <array><string>{executable}</string><string>--exact</string><string>macos::launchd_retries_canonical_listener_after_the_prior_owner_releases_it</string><string>--nocapture</string></array>
+  <array><string>{executable}</string><string>--exact</string><string>macos::launchd_retries_direct_bind_after_the_prior_owner_releases_it</string><string>--nocapture</string></array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>{child_env}</key><string>1</string>
     <key>{ready_env}</key><string>{ready}</string>
-  </dict>
-  <key>Sockets</key>
-  <dict>
-    <key>broker-ceremony</key>
-    <dict>
-      <key>SockNodeName</key><string>127.0.0.1</string>
-      <key>SockServiceName</key><integer>18734</integer>
-      <key>SockFamily</key><string>IPv4</string>
-      <key>SockProtocol</key><string>TCP</string>
-      <key>SockType</key><string>stream</string>
-    </dict>
   </dict>
   <key>KeepAlive</key>
   <dict><key>SuccessfulExit</key><false/></dict>
@@ -112,7 +101,7 @@ mod macos {
         thread::sleep(Duration::from_secs(2));
         assert!(
             !ready.exists(),
-            "launchd handed out or shared the canonical listener while a foreign owner still held it"
+            "the waiting Broker acquired the canonical listener while a foreign owner still held it"
         );
         drop(foreign);
 
@@ -126,7 +115,7 @@ mod macos {
                 .output()
                 .expect("inspect disposable LaunchAgent");
             panic!(
-                "launchd did not retain/retry the waiting canonical listener after release\nbootstrap status: {}\nbootstrap stderr: {}\nlaunchd stdout: {}\nlaunchd stderr: {}",
+                "launchd did not retry the Broker's direct bind after release\nbootstrap status: {}\nbootstrap stderr: {}\nlaunchd stdout: {}\nlaunchd stderr: {}",
                 bootstrap.status,
                 String::from_utf8_lossy(&bootstrap.stderr),
                 String::from_utf8_lossy(&state.stdout),

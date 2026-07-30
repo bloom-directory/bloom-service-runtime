@@ -42,6 +42,15 @@ fn make_installer_payload(root: &Path) -> PathBuf {
     ] {
         fs::write(payload.join("config").join(config), b"{}").unwrap();
     }
+    fs::write(
+        payload.join("config/edge-manifest.json"),
+        br#"{
+  "machine_uid": @LOGIN_UID@,
+  "broker_uid": @BLOOM_BROKER_UID@,
+  "signer_uid": @BLOOM_SIGNER_UID@
+}"#,
+    )
+    .unwrap();
     fs::create_dir_all(payload.join("credentials")).unwrap();
     fs::write(
         payload.join("config/aws-kms-ip-allow.conf"),
@@ -317,7 +326,7 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
 }
 
 #[test]
-fn macos_installer_renders_private_launchagents_and_confirmed_uninstall() {
+fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     fs::create_dir(&root).unwrap();
@@ -329,6 +338,12 @@ fn macos_installer_renders_private_launchagents_and_confirmed_uninstall() {
         .args(["501", "alice"])
         .arg(&payload)
         .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .env("BLOOM_MACOS_BROKER_UID", "250501")
+        .env("BLOOM_MACOS_SIGNER_UID", "250502")
+        .env("BLOOM_MACOS_MACHINE_BROKER_GID", "260501")
+        .env("BLOOM_MACOS_BROKER_SIGNER_GID", "260502")
+        .env("BLOOM_MACOS_REVOKE_GID", "260503")
+        .env("BLOOM_RELEASE_DIGEST", "11".repeat(32))
         .output()
         .unwrap();
     assert!(
@@ -336,15 +351,16 @@ fn macos_installer_renders_private_launchagents_and_confirmed_uninstall() {
         "{}",
         String::from_utf8_lossy(&installed.stderr)
     );
-    let broker_plist = root.join("Library/LaunchAgents/com.bloom.broker.501.plist");
-    let signer_plist = root.join("Library/LaunchAgents/com.bloom.signer.501.plist");
+    let broker_plist = root.join("Library/LaunchDaemons/com.bloom.broker.501.plist");
+    let signer_plist = root.join("Library/LaunchDaemons/com.bloom.signer.501.plist");
     for plist in [&broker_plist, &signer_plist] {
         let source = fs::read_to_string(plist).unwrap();
         assert!(!source.contains("@BLOOM_"));
         assert!(source.contains("BLOOM_AUDIT_CHECKPOINT_DIR"));
+        assert!(source.contains("<key>UserName</key>"));
         assert_eq!(
             fs::metadata(plist).unwrap().permissions().mode() & 0o777,
-            0o600
+            0o644
         );
         if cfg!(target_os = "macos") {
             assert!(
@@ -358,14 +374,30 @@ fn macos_installer_renders_private_launchagents_and_confirmed_uninstall() {
         }
     }
     assert_eq!(
-        fs::metadata(
-            root.join("Library/Application Support/BloomTriad/logins/501/signer/audit-checkpoints")
-        )
-        .unwrap()
-        .permissions()
-        .mode()
+        fs::metadata(root.join("var/db/bloom/501/signer/audit-checkpoints"))
+            .unwrap()
+            .permissions()
+            .mode()
             & 0o777,
         0o700
+    );
+    let edge_manifest = fs::read_to_string(
+        root.join("Library/Application Support/BloomTriad/config/501/edge-manifest.json"),
+    )
+    .unwrap();
+    assert!(edge_manifest.contains("\"machine_uid\": 501"));
+    assert!(edge_manifest.contains("\"broker_uid\": 250501"));
+    assert!(edge_manifest.contains("\"signer_uid\": 250502"));
+    let pf = fs::read_to_string(root.join("etc/pf.anchors/com.bloom.triad.501")).unwrap();
+    assert!(pf.contains("user 250501"));
+    assert!(pf.contains("user 250502"));
+    assert!(
+        root.join("usr/local/libexec/bloom/current/bloom-broker")
+            .exists()
+    );
+    assert!(
+        root.join("Library/LaunchAgents/com.bloom.session.plist")
+            .exists()
     );
     assert!(
         Command::new(&installer)
@@ -378,4 +410,9 @@ fn macos_installer_renders_private_launchagents_and_confirmed_uninstall() {
     );
     assert!(!broker_plist.exists());
     assert!(!signer_plist.exists());
+    assert!(
+        root.join("usr/local/libexec/bloom/current/bloom-broker")
+            .exists(),
+        "per-login uninstall must not remove the shared release"
+    );
 }
