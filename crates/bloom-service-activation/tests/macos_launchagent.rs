@@ -30,7 +30,7 @@ fn broker_launchdaemon_selects_owned_unix_sockets_and_direct_ceremony_bind() {
 
     assert!(source.contains("<key>UserName</key>"));
     assert!(source.contains("@BLOOM_BROKER_USER@"));
-    assert!(source.contains("<key>GroupName</key>\n  <string>@BLOOM_REVOKE_GROUP@</string>"));
+    assert!(source.contains("<key>GroupName</key>\n  <string>@BLOOM_BROKER_GROUP@</string>"));
     assert!(source.contains("<key>InitGroups</key>\n  <true/>"));
     assert!(source.contains("<key>BLOOM_BROKER_SOCKET</key>"));
     assert!(source.contains("@BLOOM_BROKER_SOCKET@"));
@@ -65,7 +65,7 @@ fn signer_launchdaemon_exposes_only_broker_and_revoke_group_edges() {
 
     assert!(source.contains("<key>UserName</key>"));
     assert!(source.contains("@BLOOM_SIGNER_USER@"));
-    assert!(source.contains("<key>GroupName</key>\n  <string>@BLOOM_REVOKE_GROUP@</string>"));
+    assert!(source.contains("<key>GroupName</key>\n  <string>@BLOOM_SIGNER_GROUP@</string>"));
     assert!(source.contains("<key>InitGroups</key>\n  <true/>"));
     assert!(source.contains("<key>BLOOM_SIGNER_SOCKET</key>"));
     assert!(source.contains("@BLOOM_SIGNER_SOCKET@"));
@@ -112,6 +112,8 @@ fn broker_requires_the_authenticated_session_socket_before_ceremonies() {
     assert!(machine.contains("bloom-session"));
     assert!(machine.contains("remove_owned_stale_socket"));
     assert!(machine.contains("session_socket_gid"));
+    assert!(machine.contains("std::os::unix::fs::chown(&socket_path"));
+    assert!(!machine.contains("fchown(&listener"));
 
     let cli = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
     assert!(cli.contains("/Library/Application Support/BloomTriad/enrollments/"));
