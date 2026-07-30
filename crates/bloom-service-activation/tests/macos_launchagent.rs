@@ -222,6 +222,29 @@ fn macos_upgrade_is_global_journaled_and_health_checked() {
 }
 
 #[test]
+fn macos_config_rotation_is_journaled_verified_and_recoverable() {
+    let source =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    for required in [
+        "bloom.macos-config-rotation.1",
+        ".rotation-transaction.new.$$",
+        "verify_config_rotation",
+        "prepare_rotation",
+        "activate_rotation",
+        "rollback_rotation",
+        "recover_interrupted_rotation",
+        "config rotation may not change",
+        "atomic_copy_preserving_metadata",
+        "health_check_enrollment",
+    ] {
+        assert!(
+            source.contains(required),
+            "macOS installer is missing config-rotation invariant {required}"
+        );
+    }
+}
+
+#[test]
 fn activating_enrollment_is_private_to_installer_health_and_session_bootstrap() {
     let machine = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
     assert!(machine.contains("allow_activating"));
