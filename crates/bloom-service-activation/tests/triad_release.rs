@@ -401,7 +401,7 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     assert!(edge_manifest.contains("\"machine_uid\": 501"));
     assert!(edge_manifest.contains("\"broker_uid\": 250501"));
     assert!(edge_manifest.contains("\"signer_uid\": 250502"));
-    assert!(edge_manifest.contains("\"session_socket_gid\": 260501"));
+    assert!(edge_manifest.contains("\"session_socket_gid\": 260503"));
     let enrollment = fs::read_to_string(
         root.join("Library/Application Support/BloomTriad/enrollments/501.json"),
     )

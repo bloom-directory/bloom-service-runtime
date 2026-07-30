@@ -65,6 +65,8 @@ fn signer_launchdaemon_exposes_only_broker_and_revoke_group_edges() {
     assert!(source.contains("@BLOOM_SIGNER_UID@"));
     assert!(source.contains("@BROKER_SIGNER_GID@"));
     assert!(source.contains("@REVOKE_GID@"));
+    assert!(source.contains("<key>BLOOM_SESSION_SOCKET</key>"));
+    assert!(source.contains("@BLOOM_SESSION_SOCKET@"));
     assert!(!source.contains("@MACHINE_BROKER_GID@"));
     assert!(!source.contains("com.apple.security.network"));
     assert!(!source.contains("broker-ceremony"));
