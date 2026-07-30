@@ -118,6 +118,7 @@ fn broker_requires_the_authenticated_session_socket_before_ceremonies() {
     let cli = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
     assert!(cli.contains("/Library/Application Support/BloomTriad/enrollments/"));
     assert!(cli.contains("/private/var/run/bloom/{uid}/machine-broker/broker.sock"));
+    assert!(cli.contains("observed_build={}, expected_build={}, state={:?}, conditions={}"));
 }
 
 #[test]
