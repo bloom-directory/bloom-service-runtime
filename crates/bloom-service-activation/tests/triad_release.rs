@@ -261,6 +261,8 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
         "[chains.anvil]",
         "rpc_urls = [\"http://127.0.0.1:1\"]",
         "allow_broadcast = false",
+        "chown \"$login_uid\" \"$runtime/machine\"",
+        "machine_socket=\"$runtime/machine/machine.sock\"",
         "system/com.bloom.signer.$login_uid",
         "/private/var/run/bloom/$login_uid/broker-signer/signer.sock",
         "launchctl bootout \"$signer_label\"",
