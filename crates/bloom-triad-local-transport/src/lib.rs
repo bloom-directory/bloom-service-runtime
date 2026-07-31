@@ -21,8 +21,8 @@ use bloom_triad_protocol::{
     BrokerSignerService, ControlRequest, ControlResponse, DecimalU64, Digest32, EnvelopeKind,
     HelloChallenge, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, OperationId,
     ProtocolError, ProtocolErrorCode, ProtocolVersion, RPC_ENVELOPE_SCHEMA_V1,
-    RevocationControlService, SignedEnvelope, Token, TypedRequestMethod, UnsignedEnvelope,
-    decode_frame, encode_frame,
+    RevocationControlService, SignedEnvelope, SignedJournalHead, Token, TypedRequestMethod,
+    UnsignedEnvelope, decode_frame, encode_frame,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
@@ -542,6 +542,52 @@ pub fn sign_request<T>(
 where
     T: Clone + Serialize + TypedRequestMethod,
 {
+    sign_request_with_optional_journal_head(
+        identity,
+        audience,
+        operation_id,
+        body,
+        sent_at_ms,
+        deadline_ms,
+        None,
+    )
+}
+
+pub fn sign_request_with_journal_head<T>(
+    identity: &LocalIdentity,
+    audience: Token,
+    operation_id: OperationId,
+    body: T,
+    sent_at_ms: u64,
+    deadline_ms: u64,
+    sender_journal_head: SignedJournalHead,
+) -> Result<SignedEnvelope<T>, ProtocolError>
+where
+    T: Clone + Serialize + TypedRequestMethod,
+{
+    sign_request_with_optional_journal_head(
+        identity,
+        audience,
+        operation_id,
+        body,
+        sent_at_ms,
+        deadline_ms,
+        Some(sender_journal_head),
+    )
+}
+
+fn sign_request_with_optional_journal_head<T>(
+    identity: &LocalIdentity,
+    audience: Token,
+    operation_id: OperationId,
+    body: T,
+    sent_at_ms: u64,
+    deadline_ms: u64,
+    sender_journal_head: Option<SignedJournalHead>,
+) -> Result<SignedEnvelope<T>, ProtocolError>
+where
+    T: Clone + Serialize + TypedRequestMethod,
+{
     let request_digest = digest(&body)?;
     let unsigned = UnsignedEnvelope {
         protocol: ProtocolVersion::CURRENT,
@@ -557,6 +603,7 @@ where
         deadline_ms: DecimalU64::new(deadline_ms),
         body,
         application_key_id: identity.application_key_id.clone(),
+        sender_journal_head,
     };
     let signature = identity.signing_key.sign(&unsigned.canonical_bytes()?);
     Ok(SignedEnvelope {
@@ -576,6 +623,43 @@ where
     T: Serialize,
     U: Serialize,
 {
+    sign_response_with_optional_journal_head(identity, request, body, sent_at_ms, deadline_ms, None)
+}
+
+pub fn sign_response_with_journal_head<T, U>(
+    identity: &LocalIdentity,
+    request: &SignedEnvelope<U>,
+    body: T,
+    sent_at_ms: u64,
+    deadline_ms: u64,
+    sender_journal_head: SignedJournalHead,
+) -> Result<SignedEnvelope<T>, ProtocolError>
+where
+    T: Serialize,
+    U: Serialize,
+{
+    sign_response_with_optional_journal_head(
+        identity,
+        request,
+        body,
+        sent_at_ms,
+        deadline_ms,
+        Some(sender_journal_head),
+    )
+}
+
+fn sign_response_with_optional_journal_head<T, U>(
+    identity: &LocalIdentity,
+    request: &SignedEnvelope<U>,
+    body: T,
+    sent_at_ms: u64,
+    deadline_ms: u64,
+    sender_journal_head: Option<SignedJournalHead>,
+) -> Result<SignedEnvelope<T>, ProtocolError>
+where
+    T: Serialize,
+    U: Serialize,
+{
     let unsigned = UnsignedEnvelope {
         protocol: ProtocolVersion::CURRENT,
         schema: Token::new(RPC_ENVELOPE_SCHEMA_V1)?,
@@ -590,12 +674,36 @@ where
         deadline_ms: DecimalU64::new(deadline_ms),
         body,
         application_key_id: identity.application_key_id.clone(),
+        sender_journal_head,
     };
     let signature = identity.signing_key.sign(&unsigned.canonical_bytes()?);
     Ok(SignedEnvelope {
         unsigned,
         signature: Base64UrlBytes::from_bytes(&signature.to_bytes()),
     })
+}
+
+/// Signs a service journal head with the same application identity pinned for
+/// the authenticated local transport edge.
+pub fn sign_journal_head(
+    identity: &LocalIdentity,
+    sequence: u64,
+    head_hash: Digest32,
+) -> SignedJournalHead {
+    let mut head = SignedJournalHead {
+        service_id: identity.service_id.clone(),
+        sequence: DecimalU64::new(sequence),
+        head_hash,
+        key_id: identity.application_key_id.clone(),
+        signature: Base64UrlBytes::from_bytes(&[]),
+    };
+    head.signature = Base64UrlBytes::from_bytes(
+        &identity
+            .signing_key
+            .sign(&head.signature_message())
+            .to_bytes(),
+    );
+    head
 }
 
 pub async fn call<T, U>(
@@ -609,17 +717,56 @@ where
     T: Clone + Serialize + TypedRequestMethod,
     U: Serialize + DeserializeOwned,
 {
+    call_with_optional_journal_head(stream, identity, server, body, timeout_ms, None).await
+}
+
+pub async fn call_with_journal_head<T, U>(
+    stream: &mut UnixStream,
+    identity: &LocalIdentity,
+    server: &PeerAcl,
+    body: T,
+    timeout_ms: u64,
+    sender_journal_head: SignedJournalHead,
+) -> Result<U, ProtocolError>
+where
+    T: Clone + Serialize + TypedRequestMethod,
+    U: Serialize + DeserializeOwned,
+{
+    call_with_optional_journal_head(
+        stream,
+        identity,
+        server,
+        body,
+        timeout_ms,
+        Some(sender_journal_head),
+    )
+    .await
+}
+
+async fn call_with_optional_journal_head<T, U>(
+    stream: &mut UnixStream,
+    identity: &LocalIdentity,
+    server: &PeerAcl,
+    body: T,
+    timeout_ms: u64,
+    sender_journal_head: Option<SignedJournalHead>,
+) -> Result<U, ProtocolError>
+where
+    T: Clone + Serialize + TypedRequestMethod,
+    U: Serialize + DeserializeOwned,
+{
     authenticate_client(stream, identity, server).await?;
     let observed_uid = peer_uid(stream)?;
     let sent_at_ms = now_ms()?;
     let operation_id = body.operation_id()?.unwrap_or_else(random_operation_id);
-    let request = sign_request(
+    let request = sign_request_with_optional_journal_head(
         identity,
         server.service_id.clone(),
         operation_id,
         body,
         sent_at_ms,
         sent_at_ms.saturating_add(timeout_ms),
+        sender_journal_head,
     )?;
     write_frame(stream, &request).await?;
 
@@ -662,6 +809,41 @@ where
     T: Serialize,
     U: Serialize,
 {
+    send_response_with_optional_journal_head(stream, identity, request, response, None).await
+}
+
+pub async fn send_response_with_journal_head<T, U>(
+    stream: &mut UnixStream,
+    identity: &LocalIdentity,
+    request: &SignedEnvelope<T>,
+    response: Result<U, ProtocolError>,
+    sender_journal_head: SignedJournalHead,
+) -> Result<(), ProtocolError>
+where
+    T: Serialize,
+    U: Serialize,
+{
+    send_response_with_optional_journal_head(
+        stream,
+        identity,
+        request,
+        response,
+        Some(sender_journal_head),
+    )
+    .await
+}
+
+async fn send_response_with_optional_journal_head<T, U>(
+    stream: &mut UnixStream,
+    identity: &LocalIdentity,
+    request: &SignedEnvelope<T>,
+    response: Result<U, ProtocolError>,
+    sender_journal_head: Option<SignedJournalHead>,
+) -> Result<(), ProtocolError>
+where
+    T: Serialize,
+    U: Serialize,
+{
     let sent_at_ms = now_ms()?;
     if sent_at_ms >= request.unsigned.deadline_ms.get() {
         return Err(ProtocolError::new(
@@ -669,12 +851,13 @@ where
             "request deadline expired before response",
         ));
     }
-    let envelope = sign_response(
+    let envelope = sign_response_with_optional_journal_head(
         identity,
         request,
         response,
         sent_at_ms,
         request.unsigned.deadline_ms.get(),
+        sender_journal_head,
     )?;
     write_frame(stream, &envelope).await
 }
@@ -1276,6 +1459,107 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, ProtocolErrorCode::ServiceUnavailable);
         drop(client);
+    }
+
+    #[test]
+    fn broker_signer_envelope_builders_bind_required_journal_heads() {
+        let broker = identity("bloom-broker", 2);
+        let signer = identity("bloom-signer", 3);
+        let broker_acl = acl(&broker, 501);
+        let signer_acl = acl(&signer, 502);
+        let broker_head = sign_journal_head(&broker, 4, Digest32::from_bytes([4; 32]));
+        let request = sign_request_with_journal_head(
+            &broker,
+            signer.service_id.clone(),
+            OperationId::from_bytes([5; 32]),
+            BrokerSignerRequest::SignerReadiness(bloom_triad_protocol::Empty {}),
+            10,
+            20,
+            broker_head.clone(),
+        )
+        .unwrap();
+        request
+            .verify_typed(
+                501,
+                &broker_acl.authenticated_for(signer.service_id.clone()),
+            )
+            .unwrap();
+        assert_eq!(request.unsigned.sender_journal_head, Some(broker_head));
+
+        let missing = sign_request(
+            &broker,
+            signer.service_id.clone(),
+            OperationId::from_bytes([6; 32]),
+            BrokerSignerRequest::SignerReadiness(bloom_triad_protocol::Empty {}),
+            10,
+            20,
+        )
+        .unwrap();
+        assert_eq!(
+            missing
+                .verify_typed(
+                    501,
+                    &broker_acl.authenticated_for(signer.service_id.clone())
+                )
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::UnauthenticatedPeer
+        );
+
+        let signer_head = sign_journal_head(&signer, 8, Digest32::from_bytes([8; 32]));
+        let response = sign_response_with_journal_head(
+            &signer,
+            &request,
+            Ok::<_, ProtocolError>(BrokerSignerResponse::SignerReadiness(
+                bloom_triad_protocol::Readiness {
+                    service_id: signer.service_id.clone(),
+                    service_version: "test".into(),
+                    build_digest: Digest32::from_bytes([9; 32]),
+                    boot_epoch: signer.boot_epoch.clone(),
+                    state: bloom_triad_protocol::ReadinessState::Ready,
+                    conditions: vec![],
+                },
+            )),
+            11,
+            20,
+            signer_head.clone(),
+        )
+        .unwrap();
+        response
+            .verify_response_to(
+                502,
+                &signer_acl.authenticated_for(broker.service_id.clone()),
+                &request,
+            )
+            .unwrap();
+        assert_eq!(response.unsigned.sender_journal_head, Some(signer_head));
+    }
+
+    #[test]
+    fn machine_broker_envelope_builder_forbids_journal_head_injection() {
+        let machine = identity("bloom-machine", 1);
+        let broker = identity("bloom-broker", 2);
+        let machine_acl = acl(&machine, 501);
+        let injected = sign_request_with_journal_head(
+            &machine,
+            broker.service_id.clone(),
+            OperationId::from_bytes([7; 32]),
+            MachineBrokerRequest::ActionValidate(Digest32::from_bytes([7; 32])),
+            10,
+            20,
+            sign_journal_head(&machine, 1, Digest32::from_bytes([1; 32])),
+        )
+        .unwrap();
+        assert_eq!(
+            injected
+                .verify_typed(
+                    501,
+                    &machine_acl.authenticated_for(broker.service_id.clone())
+                )
+                .unwrap_err()
+                .code,
+            ProtocolErrorCode::UnauthenticatedPeer
+        );
     }
 
     #[test]

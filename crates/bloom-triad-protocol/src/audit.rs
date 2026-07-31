@@ -1,3 +1,4 @@
+use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{Base64UrlBytes, DecimalU64, Digest32, Token};
@@ -25,5 +26,44 @@ impl SignedJournalHead {
         message.push(0);
         message.extend_from_slice(self.key_id.as_str().as_bytes());
         message
+    }
+
+    /// Verifies that this head was produced by the authenticated envelope
+    /// sender using the application identity pinned for that transport edge.
+    pub fn verify_sender_identity(
+        &self,
+        service_id: &Token,
+        application_key_id: &Token,
+        application_public_key: &[u8; 32],
+    ) -> Result<(), crate::ProtocolError> {
+        if &self.service_id != service_id || &self.key_id != application_key_id {
+            return Err(crate::ProtocolError::new(
+                crate::ProtocolErrorCode::UnauthenticatedPeer,
+                "journal head service or application key identity mismatch",
+            ));
+        }
+        let verifying_key = VerifyingKey::from_bytes(application_public_key).map_err(|_| {
+            crate::ProtocolError::new(
+                crate::ProtocolErrorCode::UnauthenticatedPeer,
+                "invalid pinned journal-head public key",
+            )
+        })?;
+        let signature: [u8; 64] = self.signature.decode().try_into().map_err(|_| {
+            crate::ProtocolError::new(
+                crate::ProtocolErrorCode::UnauthenticatedPeer,
+                "journal-head signature must contain 64 bytes",
+            )
+        })?;
+        verifying_key
+            .verify(
+                &self.signature_message(),
+                &Signature::from_bytes(&signature),
+            )
+            .map_err(|_| {
+                crate::ProtocolError::new(
+                    crate::ProtocolErrorCode::UnauthenticatedPeer,
+                    "journal-head application signature verification failed",
+                )
+            })
     }
 }

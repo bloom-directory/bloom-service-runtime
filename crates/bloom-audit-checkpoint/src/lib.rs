@@ -58,6 +58,16 @@ pub enum AppendOutcome {
     AlreadyPresent,
 }
 
+/// Injectable recipient-side sink used by Broker/Signer transport integration.
+/// Implementations must preserve the monotonic, independently retained peer
+/// head contract or return an error before a caller publishes mutation success.
+pub trait CheckpointSink: Send + Sync {
+    fn append_peer_head(
+        &self,
+        peer_head: &SignedJournalHead,
+    ) -> Result<AppendOutcome, CheckpointError>;
+}
+
 pub struct CheckpointStore {
     root: PathBuf,
     recipient_service_id: Token,
@@ -200,6 +210,15 @@ impl CheckpointStore {
     }
 }
 
+impl CheckpointSink for CheckpointStore {
+    fn append_peer_head(
+        &self,
+        peer_head: &SignedJournalHead,
+    ) -> Result<AppendOutcome, CheckpointError> {
+        self.append(peer_head)
+    }
+}
+
 pub struct PinnedAuditKey {
     pub service_id: Token,
     pub key_id: Token,
@@ -236,6 +255,20 @@ mod tests {
     use bloom_triad_protocol::{Base64UrlBytes, DecimalU64, Digest32};
     use ed25519_dalek::{Signer as _, SigningKey};
     use std::os::unix::fs::symlink;
+
+    struct ForcedFailureSink;
+
+    impl CheckpointSink for ForcedFailureSink {
+        fn append_peer_head(
+            &self,
+            _peer_head: &SignedJournalHead,
+        ) -> Result<AppendOutcome, CheckpointError> {
+            Err(CheckpointError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "forced checkpoint failure",
+            )))
+        }
+    }
 
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&[7; 32])
@@ -384,5 +417,15 @@ mod tests {
                 Err(CheckpointError::Malformed(_))
             ));
         }
+    }
+
+    #[test]
+    fn injectable_sink_propagates_forced_write_failure() {
+        let sink: &dyn CheckpointSink = &ForcedFailureSink;
+        assert!(matches!(
+            sink.append_peer_head(&head(1, "11")),
+            Err(CheckpointError::Io(error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
     }
 }

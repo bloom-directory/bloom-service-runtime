@@ -4,7 +4,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     Base64UrlBytes, BootEpoch, DecimalU64, Digest32, OperationId, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR_MAX, PROTOCOL_MINOR_MIN, ProtocolError, ProtocolErrorCode, Token,
+    PROTOCOL_MINOR_MAX, PROTOCOL_MINOR_MIN, ProtocolError, ProtocolErrorCode, SignedJournalHead,
+    Token,
 };
 
 pub const RPC_ENVELOPE_SCHEMA_V1: &str = "bloom.rpc-envelope.1";
@@ -61,6 +62,10 @@ pub struct UnsignedEnvelope<T> {
     pub deadline_ms: DecimalU64,
     pub body: T,
     pub application_key_id: Token,
+    /// Independently signed sender audit head. Protocol minor 1 requires this
+    /// on the Broker-Signer edge and forbids it on every other edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_journal_head: Option<SignedJournalHead>,
 }
 
 impl<T: Serialize> UnsignedEnvelope<T> {
@@ -195,7 +200,44 @@ impl<T: Serialize> SignedEnvelope<T> {
                     ProtocolErrorCode::UnauthenticatedPeer,
                     "application signature verification failed",
                 )
-            })
+            })?;
+
+        self.verify_sender_journal_head(expected)
+    }
+
+    fn verify_sender_journal_head(
+        &self,
+        expected: &AuthenticatedPeer,
+    ) -> Result<(), ProtocolError> {
+        let broker_signer_edge = is_broker_signer_edge(
+            self.unsigned.caller_service_id.as_str(),
+            self.unsigned.audience.as_str(),
+        );
+        if self.unsigned.protocol.minor == 0 {
+            if self.unsigned.sender_journal_head.is_some() || broker_signer_edge {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::UnsupportedVersion,
+                    "Broker-Signer journal heads require protocol minor 1 without downgrade",
+                ));
+            }
+            return Ok(());
+        }
+        match (&self.unsigned.sender_journal_head, broker_signer_edge) {
+            (Some(head), true) => head.verify_sender_identity(
+                &self.unsigned.caller_service_id,
+                &self.unsigned.application_key_id,
+                &expected.application_public_key,
+            ),
+            (None, true) => Err(ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "Broker-Signer envelope omitted its signed sender journal head",
+            )),
+            (Some(_), false) => Err(ProtocolError::new(
+                ProtocolErrorCode::UnauthenticatedPeer,
+                "sender journal heads are forbidden outside the Broker-Signer edge",
+            )),
+            (None, false) => Ok(()),
+        }
     }
 
     /// Verifies a response and binds it to the exact authenticated request.
@@ -219,6 +261,13 @@ impl<T: Serialize> SignedEnvelope<T> {
         }
         Ok(())
     }
+}
+
+fn is_broker_signer_edge(caller: &str, audience: &str) -> bool {
+    matches!(
+        (caller, audience),
+        ("bloom-broker", "bloom-signer") | ("bloom-signer", "bloom-broker")
+    )
 }
 
 impl<T: Serialize + TypedRequestMethod> SignedEnvelope<T> {
@@ -276,6 +325,19 @@ mod tests {
         }
     }
 
+    fn journal_head(signing_key: &SigningKey, service: &str, key_id: &str) -> SignedJournalHead {
+        let mut head = SignedJournalHead {
+            service_id: Token::new(service).unwrap(),
+            sequence: DecimalU64::new(7),
+            head_hash: Digest32::from_bytes([9; 32]),
+            key_id: Token::new(key_id).unwrap(),
+            signature: Base64UrlBytes::from_bytes(&[]),
+        };
+        head.signature =
+            Base64UrlBytes::from_bytes(&signing_key.sign(&head.signature_message()).to_bytes());
+        head
+    }
+
     fn signed() -> (SignedEnvelope<String>, AuthenticatedPeer) {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let body = "body".to_owned();
@@ -294,6 +356,7 @@ mod tests {
             deadline_ms: DecimalU64::new(20),
             body,
             application_key_id: Token::new("broker-app-1").unwrap(),
+            sender_journal_head: Some(journal_head(&signing_key, "bloom-broker", "broker-app-1")),
         };
         let signature = signing_key.sign(&unsigned.canonical_bytes().unwrap());
         let envelope = SignedEnvelope {
@@ -342,6 +405,7 @@ mod tests {
             deadline_ms: DecimalU64::new(20),
             body,
             application_key_id: Token::new("machine-app").unwrap(),
+            sender_journal_head: None,
         };
         let envelope = SignedEnvelope {
             signature: Base64UrlBytes::from_bytes(
