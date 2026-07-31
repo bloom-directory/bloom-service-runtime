@@ -247,6 +247,8 @@ fn release_bundle_allows_signer_authority_but_rejects_machine_owned_authority() 
 fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
     let w0 = workspace().join("packaging/triad/macos/w0");
     let acceptance = fs::read_to_string(w0.join("run-installed-acceptance.sh")).unwrap();
+    assert!(acceptance.contains("source cleanliness inspection failed"));
+    assert!(acceptance.contains("if ! tracked_status=\"$("));
     assert!(acceptance.contains("run-packaged-machine-negative.sh"));
     assert!(
         acceptance.contains("installed payload unexpectedly has an alternate Machine executable")
@@ -313,7 +315,6 @@ fn tart_bundle_build_runs_strict_machine_boundary_before_compilation() {
     );
     assert!(source.contains("git clone --quiet \"$bundle\" \"$temporary\""));
     assert!(source.contains("git -C \"$temporary\" fsck --no-dangling"));
-    assert!(source.contains("chmod -R a-w \"$target\""));
     assert!(source.contains("[[ ! -L \"$local_source_root\" ]]"));
     assert!(source.contains("for replacement_path in \"$temporary\" \"$target\""));
     assert!(!source.contains("readonly main_root=\"$shared_root/bloom\""));
@@ -331,6 +332,29 @@ fn tart_bundle_build_runs_strict_machine_boundary_before_compilation() {
         execution.contains("readonly local_source_root=\"$HOME/Library/Caches/bloom-w0-sources\"")
     );
     assert!(!execution.contains("readonly main_root=\"$shared_root/bloom\""));
+
+    let acceptance = fs::read_to_string(w0.join("run-installed-acceptance.sh")).unwrap();
+    assert_eq!(
+        acceptance
+            .matches("assert_source \"$main_root\" BLOOM_MACHINE_SHA")
+            .count(),
+        2,
+        "installed acceptance must prove exact Machine source before and after tests"
+    );
+    assert_eq!(
+        acceptance
+            .matches("assert_source \"$broker_root\" BLOOM_BROKER_SHA")
+            .count(),
+        2,
+        "installed acceptance must prove exact Broker source before and after tests"
+    );
+    assert_eq!(
+        acceptance
+            .matches("assert_source \"$signer_root\" BLOOM_SIGNER_SHA")
+            .count(),
+        2,
+        "installed acceptance must prove exact Signer source before and after tests"
+    );
 }
 
 fn macos_subject(payload: &Path) -> std::process::Output {
