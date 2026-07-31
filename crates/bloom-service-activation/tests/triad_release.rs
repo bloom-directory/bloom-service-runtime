@@ -292,9 +292,8 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
 
 #[test]
 fn tart_bundle_build_runs_strict_machine_boundary_before_compilation() {
-    let source =
-        fs::read_to_string(workspace().join("packaging/triad/macos/w0/tart-build-guest.sh"))
-            .unwrap();
+    let w0 = workspace().join("packaging/triad/macos/w0");
+    let source = fs::read_to_string(w0.join("tart-build-guest.sh")).unwrap();
     let boundary = source
         .find("check-machine-authority-boundary.sh\" \\\n  --require-clean")
         .expect("Tart build must invoke the strict Machine authority boundary");
@@ -312,6 +311,26 @@ fn tart_bundle_build_runs_strict_machine_boundary_before_compilation() {
         boundary < bundle_build,
         "boundary check must precede bundle assembly"
     );
+    assert!(source.contains("git clone --quiet \"$bundle\" \"$temporary\""));
+    assert!(source.contains("git -C \"$temporary\" fsck --no-dangling"));
+    assert!(source.contains("chmod -R a-w \"$target\""));
+    assert!(source.contains("[[ ! -L \"$local_source_root\" ]]"));
+    assert!(source.contains("for replacement_path in \"$temporary\" \"$target\""));
+    assert!(!source.contains("readonly main_root=\"$shared_root/bloom\""));
+
+    let runner = fs::read_to_string(w0.join("run-tart-local.sh")).unwrap();
+    assert!(runner.contains("git -C \"$repository_root\" bundle create"));
+    assert!(runner.contains("git -C \"$repository_root\" bundle verify \"$temporary\""));
+    assert!(runner.contains("git -C \"$repository_root\" bundle list-heads \"$temporary\""));
+    assert!(runner.contains("$bundled_revision\" != \"$revision"));
+    assert!(runner.contains("--dir=\"output:$local_output_root\""));
+    assert!(!runner.contains("--dir=\"bloom:$main_root:ro\""));
+
+    let execution = fs::read_to_string(w0.join("tart-run-guest.sh")).unwrap();
+    assert!(
+        execution.contains("readonly local_source_root=\"$HOME/Library/Caches/bloom-w0-sources\"")
+    );
+    assert!(!execution.contains("readonly main_root=\"$shared_root/bloom\""));
 }
 
 fn macos_subject(payload: &Path) -> std::process::Output {
