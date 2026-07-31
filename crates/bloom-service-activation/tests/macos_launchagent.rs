@@ -555,6 +555,8 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(two_login.contains("two-login upgrade rollback split the installed release"));
     assert!(two_login.contains("mui_09.pass"));
     assert!(two_login.contains("macos-conformance-subject.sh"));
+    assert!(two_login.contains("shasum -a 256 \"$manifest\""));
+    assert!(!two_login.contains("RELEASE_DIGEST"));
     assert!(
         !two_login.contains("touch \"$marker\"")
             && !two_login.contains("install -m 0600 /dev/null \"$marker\""),
