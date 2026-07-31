@@ -520,6 +520,18 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("Broker opened a fallback TCP listener"));
     assert!(source.contains("foreign_or_unverifiable_process"));
     assert!(source.contains("Bloom Broker startup failed: a foreign or unverifiable process"));
+    let foreign_bind = source
+        .find("/usr/bin/nc -lk 127.0.0.1 18734")
+        .expect("foreign listener bind");
+    let freshness_wait = source[foreign_bind..]
+        .find("network_containment.maximum_age_ms")
+        .map(|offset| foreign_bind + offset)
+        .expect("containment freshness wait after foreign bind");
+    let broker_bootstrap = source[freshness_wait..]
+        .find("launchctl bootstrap system \"$broker_plist\"")
+        .map(|offset| freshness_wait + offset)
+        .expect("Broker bootstrap after containment freshness wait");
+    assert!(foreign_bind < freshness_wait && freshness_wait < broker_bootstrap);
     assert!(source.contains("Signer opened a forbidden IPv6 loopback TCP connection"));
     assert!(source.contains("assert_udp_blocked"));
     assert!(source.contains("forbidden non-loopback IPv4 TCP connection"));
