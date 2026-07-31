@@ -155,6 +155,158 @@ fn release_bundle_rejects_triad_developer_harness_artifacts() {
     assert!(!launcher.contains("--features local-integration"));
 }
 
+#[test]
+fn release_bundle_rejects_legacy_machine_authority_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    fs::create_dir_all(staging.join("machine/state/auth")).unwrap();
+    fs::write(
+        staging.join("machine/state/auth/auth.sqlite"),
+        b"legacy authority",
+    )
+    .unwrap();
+
+    let rejected = build(
+        &staging,
+        &directory.path().join("rejected.tar.gz"),
+        &directory.path().join("unused-key"),
+    );
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains(
+            "forbidden production Machine artifact legacy authority file: machine/state/auth/auth.sqlite"
+        ),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn release_bundle_rejects_legacy_machine_authority_symbols_or_strings() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    fs::write(
+        staging.join("bin/bloom"),
+        b"#!/bin/sh\n# PrivateKeySigner\necho bloom 0.1.3\n",
+    )
+    .unwrap();
+
+    let rejected = build(
+        &staging,
+        &directory.path().join("rejected.tar.gz"),
+        &directory.path().join("unused-key"),
+    );
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("forbidden production Machine artifact marker: PrivateKeySigner"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn release_bundle_allows_signer_authority_but_rejects_machine_owned_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    fs::write(
+        staging.join("bin/bloom-signer"),
+        b"#!/bin/sh\n# PrivateKeySigner is conforming Signer authority\necho bloom-signer 0.1.0\n",
+    )
+    .unwrap();
+    let key = directory.path().join("release-key");
+    generate_ed25519_key(&key);
+    let allowed = build(&staging, &directory.path().join("allowed.tar.gz"), &key);
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+
+    fs::create_dir_all(staging.join("machine/plugins")).unwrap();
+    fs::write(
+        staging.join("machine/plugins/authority.txt"),
+        b"PrivateKeySigner\n",
+    )
+    .unwrap();
+    let rejected = build(
+        &staging,
+        &directory.path().join("rejected-machine.tar.gz"),
+        &key,
+    );
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("forbidden production Machine artifact marker: PrivateKeySigner"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
+
+#[test]
+fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
+    let w0 = workspace().join("packaging/triad/macos/w0");
+    let acceptance = fs::read_to_string(w0.join("run-installed-acceptance.sh")).unwrap();
+    assert!(acceptance.contains("run-packaged-machine-negative.sh"));
+    assert!(
+        acceptance.contains("installed payload unexpectedly has an alternate Machine executable")
+    );
+
+    let negative = fs::read_to_string(w0.join("run-packaged-machine-negative.sh")).unwrap();
+    for required in [
+        "serve",
+        "hostile-unix-listener",
+        "BLOOM_BROKER_SOCKET",
+        "system/com.bloom.signer.$login_uid",
+        "/private/var/run/bloom/$login_uid/broker-signer/signer.sock",
+        "launchctl bootout \"$signer_label\"",
+        "launchctl bootstrap system \"$signer_plist\"",
+        "signer_socket_dir_owner=\"$(stat -f '%u'",
+        "signer_socket_dir_group=\"$(stat -f '%g'",
+        "signer_socket_dir_mode=\"$(stat -f '%Lp'",
+        "chmod 0711 \"$signer_socket_dir\"",
+        "chown \"$signer_socket_dir_owner:$signer_socket_dir_group\"",
+        "chmod \"$signer_socket_dir_mode\" \"$signer_socket_dir\"",
+        "packaged production Machine service",
+        "lsof -nP -a -p",
+        "-name auth",
+        "-name auth.sqlite",
+        "policy-session",
+        "signer-cache",
+        "did not fail the hostile Broker projection promptly",
+        "connected directly to the hostile Signer sentinel",
+    ] {
+        assert!(
+            negative.contains(required),
+            "packaged runtime negative omits {required}"
+        );
+    }
+}
+
+#[test]
+fn tart_bundle_build_runs_strict_machine_boundary_before_compilation() {
+    let source =
+        fs::read_to_string(workspace().join("packaging/triad/macos/w0/tart-build-guest.sh"))
+            .unwrap();
+    let boundary = source
+        .find("check-machine-authority-boundary.sh\" \\\n  --require-clean")
+        .expect("Tart build must invoke the strict Machine authority boundary");
+    let cargo_build = source
+        .find("cargo build")
+        .expect("Tart build must compile production binaries");
+    let bundle_build = source
+        .find("build-bundle.sh")
+        .expect("Tart build must assemble the candidate bundle");
+    assert!(
+        boundary < cargo_build,
+        "boundary check must precede compilation"
+    );
+    assert!(
+        boundary < bundle_build,
+        "boundary check must precede bundle assembly"
+    );
+}
+
 fn macos_subject(payload: &Path) -> std::process::Output {
     Command::new(release_script("macos-conformance-subject.sh"))
         .arg(payload)
@@ -451,6 +603,27 @@ fn release_scan_rejects_debug_or_accepting_artifacts() {
     let built = build(&staging, &directory.path().join("forbidden.tar.gz"), &key);
     assert!(!built.status.success());
     assert!(String::from_utf8_lossy(&built.stderr).contains("forbidden production artifact"));
+}
+
+#[test]
+fn release_scan_rejects_empty_debug_artifacts_globally() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    fs::create_dir_all(staging.join("signer/tools")).unwrap();
+    fs::write(staging.join("signer/tools/bloom-broker-debug-driver"), b"").unwrap();
+    let built = build(
+        &staging,
+        &directory.path().join("forbidden.tar.gz"),
+        &directory.path().join("unused-key"),
+    );
+    assert!(!built.status.success());
+    assert!(
+        String::from_utf8_lossy(&built.stderr).contains(
+            "forbidden production debug/test artifact: signer/tools/bloom-broker-debug-driver"
+        ),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
 }
 
 #[test]
