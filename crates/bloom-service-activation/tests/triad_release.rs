@@ -42,6 +42,36 @@ fn machine_authority_boundary_baseline_is_ratcheted_and_strict_release_is_blocke
     assert!(release_gate.contains("check-machine-authority-boundary.sh\" --require-clean"));
 }
 
+#[test]
+fn legacy_hash_only_routes_are_checked_by_release_and_installed_acceptance() {
+    let release_dir = workspace().join("packaging/triad/release");
+    let release_gate = fs::read_to_string(release_dir.join("triad-release-gate.sh")).unwrap();
+    assert!(release_gate.contains("check-legacy-hash-only-routes.py"));
+    let bundle_gate = fs::read_to_string(release_dir.join("build-bundle.sh")).unwrap();
+    assert!(bundle_gate.contains("check-legacy-hash-only-routes.py"));
+
+    let legacy_routes = Command::new("python3")
+        .arg(release_dir.join("check-legacy-hash-only-routes.py"))
+        .output()
+        .unwrap();
+    assert!(
+        legacy_routes.status.success(),
+        "{}",
+        String::from_utf8_lossy(&legacy_routes.stderr)
+    );
+
+    let installed_acceptance = fs::read_to_string(
+        workspace().join("packaging/triad/macos/w0/run-installed-acceptance.sh"),
+    )
+    .unwrap();
+    assert!(installed_acceptance.contains("-p bloom-petals"));
+    assert!(installed_acceptance.contains("ac35_legacy_v0_1"));
+    let tart_build =
+        fs::read_to_string(workspace().join("packaging/triad/macos/w0/tart-build-guest.sh"))
+            .unwrap();
+    assert!(tart_build.contains("check-legacy-hash-only-routes.py"));
+}
+
 fn generate_ed25519_key(path: &Path) {
     assert!(
         Command::new("/usr/bin/ssh-keygen")
