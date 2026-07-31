@@ -240,6 +240,45 @@ pub fn load_identity_and_manifest(
 ) -> Result<(LocalIdentity, EdgeManifest), ProtocolError> {
     require_private_identity_permissions(identity_path)?;
     require_root_manifest_permissions(manifest_path)?;
+    decode_identity_and_manifest(identity_path, manifest_path, expected_service_id)
+}
+
+#[cfg(feature = "triad-dev-harness")]
+/// Load a same-UID developer identity without relaxing the production
+/// root-owned manifest contract.
+///
+/// Every trusted path must be a current-UID-owned, non-linked regular file
+/// beneath one current-UID-owned mode-0700 root. Production packaging never
+/// sets or calls this mode.
+pub fn load_developer_identity_and_manifest(
+    developer_root: &Path,
+    identity_path: &Path,
+    manifest_path: &Path,
+    expected_service_id: &str,
+) -> Result<(LocalIdentity, EdgeManifest), ProtocolError> {
+    let effective_uid = rustix::process::geteuid().as_raw();
+    let root = require_developer_root(developer_root, effective_uid)?;
+    require_developer_security_file(&root, identity_path, effective_uid, "identity")?;
+    require_developer_security_file(&root, manifest_path, effective_uid, "manifest")?;
+    decode_identity_and_manifest(identity_path, manifest_path, expected_service_id)
+}
+
+#[cfg(feature = "triad-dev-harness")]
+pub fn validate_developer_security_file(
+    developer_root: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<(), ProtocolError> {
+    let uid = rustix::process::geteuid().as_raw();
+    let root = require_developer_root(developer_root, uid)?;
+    require_developer_security_file(&root, path, uid, label)
+}
+
+fn decode_identity_and_manifest(
+    identity_path: &Path,
+    manifest_path: &Path,
+    expected_service_id: &str,
+) -> Result<(LocalIdentity, EdgeManifest), ProtocolError> {
     let identity_file: IdentityFile = decode_security_file(identity_path)?;
     let manifest: EdgeManifest = decode_security_file(manifest_path)?;
     if manifest.schema != "bloom.edge-manifest.1" {
@@ -282,6 +321,84 @@ pub fn load_identity_and_manifest(
         ));
     }
     Ok((identity, manifest))
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn require_developer_root(path: &Path, uid: u32) -> Result<std::path::PathBuf, ProtocolError> {
+    if uid == 0 {
+        return Err(unauthenticated("developer transport mode refuses root"));
+    }
+    if !path.is_absolute() {
+        return Err(unauthenticated("developer transport root must be absolute"));
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| unauthenticated(&format!("inspect {}: {error}", path.display())))?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o7777 != 0o700
+        || metadata.nlink() < 2
+    {
+        return Err(unauthenticated(
+            "developer transport root must be a current-UID-owned mode-0700 non-symlink directory",
+        ));
+    }
+    fs::canonicalize(path)
+        .map_err(|error| unauthenticated(&format!("canonicalize developer root: {error}")))
+}
+
+#[cfg(feature = "triad-dev-harness")]
+fn require_developer_security_file(
+    root: &Path,
+    path: &Path,
+    uid: u32,
+    label: &str,
+) -> Result<(), ProtocolError> {
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| unauthenticated(&format!("canonicalize {label}: {error}")))?;
+    if !canonical.starts_with(root) {
+        return Err(unauthenticated(&format!(
+            "developer {label} is outside the declared root"
+        )));
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| unauthenticated(&format!("inspect {}: {error}", path.display())))?;
+    if canonical != path
+        || !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(unauthenticated(&format!(
+            "developer {label} must be a canonical current-UID-owned mode-0600 singly-linked regular file"
+        )));
+    }
+    let mut parent = path.parent();
+    while let Some(component) = parent {
+        if component == root {
+            break;
+        }
+        let metadata = fs::symlink_metadata(component).map_err(|error| {
+            unauthenticated(&format!("inspect developer path component: {error}"))
+        })?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != uid
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(unauthenticated(
+                "developer transport path contains an unsafe directory",
+            ));
+        }
+        parent = component.parent();
+    }
+    if parent.is_none() {
+        return Err(unauthenticated(
+            "developer transport path did not reach the declared root",
+        ));
+    }
+    Ok(())
 }
 
 impl IdentityFile {
@@ -363,6 +480,55 @@ pub async fn authenticate_server(
         &signed_hello(identity, client_challenge.challenge.clone())?,
     )
     .await
+}
+
+/// Authenticate one member of a closed, manifest-pinned peer set.
+///
+/// This is used by shared endpoints such as the login-session sentinel where
+/// multiple service identities may intentionally run under one developer UID.
+/// OS credentials narrow the candidate set first; the signed hello then
+/// selects exactly one pinned application identity. It does not weaken either
+/// half of the normal UID + application-key authentication rule.
+pub async fn authenticate_server_one_of(
+    stream: &mut UnixStream,
+    identity: &LocalIdentity,
+    clients: &[PeerAcl],
+) -> Result<PeerAcl, ProtocolError> {
+    let observed_uid = peer_uid(stream)?;
+    let candidates = clients
+        .iter()
+        .filter(|candidate| candidate.effective_uid == observed_uid)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err(unauthenticated("OS peer effective UID is not allowed"));
+    }
+
+    let server_challenge = random_digest();
+    write_frame(stream, &signed_hello(identity, server_challenge.clone())?).await?;
+    let client_response: HelloChallenge = read_frame(stream).await?;
+    let client = candidates
+        .into_iter()
+        .find(|candidate| {
+            candidate.service_id == client_response.service_id
+                && candidate.boot_epoch == client_response.boot_epoch
+                && candidate.application_key_id == client_response.application_key_id
+        })
+        .ok_or_else(|| unauthenticated("hello identity is not in the pinned peer set"))?;
+    verify_hello(&client_response, client)?;
+    if client_response.challenge != server_challenge {
+        return Err(unauthenticated(
+            "client did not answer server's fresh challenge",
+        ));
+    }
+
+    let client_challenge: HelloChallenge = read_frame(stream).await?;
+    verify_hello(&client_challenge, client)?;
+    write_frame(
+        stream,
+        &signed_hello(identity, client_challenge.challenge.clone())?,
+    )
+    .await?;
+    Ok(client.clone())
 }
 
 pub fn sign_request<T>(
@@ -777,6 +943,8 @@ fn unavailable(message: String) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "triad-dev-harness")]
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt as _};
 
     fn identity(name: &str, key_byte: u8) -> LocalIdentity {
         LocalIdentity {
@@ -797,6 +965,150 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "triad-dev-harness")]
+    fn developer_files() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), Permissions::from_mode(0o700)).unwrap();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let identity_path = root.join("identity.json");
+        let manifest_path = root.join("manifest.json");
+        let key = SigningKey::from_bytes(&[0x42; 32]);
+        let public = hex::encode(key.verifying_key().to_bytes());
+        let uid = rustix::process::geteuid().as_raw();
+        fs::write(
+            &identity_path,
+            serde_json::to_vec(&serde_json::json!({
+                "service_id": "bloom-machine",
+                "boot_epoch": "11".repeat(16),
+                "application_key_id": "machine-app",
+                "private_key_seed_hex": hex::encode([0x42; 32])
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let peer = |service_id: &str, key_id: &str| {
+            serde_json::json!({
+                "effective_uid": uid,
+                "service_id": service_id,
+                "boot_epoch": "11".repeat(16),
+                "application_key_id": key_id,
+                "application_public_key_hex": public
+            })
+        };
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "bloom.edge-manifest.1",
+                "trusted_time_source": if cfg!(target_os = "macos") {
+                    "macos-managed-timed"
+                } else {
+                    "linux-chrony-nts"
+                },
+                "machine": peer("bloom-machine", "machine-app"),
+                "broker": peer("bloom-broker", "broker-app"),
+                "signer": peer("bloom-signer", "signer-app"),
+                "revoke_client": peer("bloom-revoke-client", "revoke-app"),
+                "session": peer("bloom-session", "session-app"),
+                "session_socket_gid": uid
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&identity_path, Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&manifest_path, Permissions::from_mode(0o600)).unwrap();
+        (directory, identity_path, manifest_path)
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_loader_is_separate_strict_and_root_refusing() {
+        let (directory, identity_path, manifest_path) = developer_files();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let loaded = load_developer_identity_and_manifest(
+            &root,
+            &identity_path,
+            &manifest_path,
+            "bloom-machine",
+        )
+        .unwrap();
+        assert_eq!(loaded.0.service_id.as_str(), "bloom-machine");
+
+        assert!(
+            load_identity_and_manifest(&identity_path, &manifest_path, "bloom-machine").is_err()
+        );
+        assert!(require_developer_root(&root, 0).is_err());
+        assert!(
+            load_developer_identity_and_manifest(
+                Path::new("relative"),
+                &identity_path,
+                &manifest_path,
+                "bloom-machine"
+            )
+            .is_err()
+        );
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::set_permissions(outside.path(), Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            load_developer_identity_and_manifest(
+                &root,
+                outside.path(),
+                &manifest_path,
+                "bloom-machine"
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_loader_rejects_links_and_broad_modes() {
+        let (directory, identity_path, manifest_path) = developer_files();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let hardlink = root.join("identity-hardlink.json");
+        fs::hard_link(&identity_path, &hardlink).unwrap();
+        assert!(
+            load_developer_identity_and_manifest(
+                &root,
+                &identity_path,
+                &manifest_path,
+                "bloom-machine"
+            )
+            .is_err()
+        );
+        fs::remove_file(hardlink).unwrap();
+
+        let symlink = root.join("identity-symlink.json");
+        std::os::unix::fs::symlink(&identity_path, &symlink).unwrap();
+        assert!(
+            load_developer_identity_and_manifest(&root, &symlink, &manifest_path, "bloom-machine")
+                .is_err()
+        );
+        fs::remove_file(symlink).unwrap();
+
+        fs::set_permissions(&manifest_path, Permissions::from_mode(0o640)).unwrap();
+        assert!(
+            load_developer_identity_and_manifest(
+                &root,
+                &identity_path,
+                &manifest_path,
+                "bloom-machine"
+            )
+            .is_err()
+        );
+        fs::set_permissions(&manifest_path, Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&root, Permissions::from_mode(0o750)).unwrap();
+        assert!(
+            load_developer_identity_and_manifest(
+                &root,
+                &identity_path,
+                &manifest_path,
+                "bloom-machine"
+            )
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn mutual_challenge_and_uid_acl_succeed() {
         let (mut machine_stream, mut broker_stream) = UnixStream::pair().unwrap();
@@ -811,6 +1123,54 @@ mod tests {
         );
         client.unwrap();
         server.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_peer_set_distinguishes_services_sharing_one_uid() {
+        let (mut signer_stream, mut session_stream) = UnixStream::pair().unwrap();
+        let uid = signer_stream.peer_cred().unwrap().uid();
+        let session = identity("bloom-session", 4);
+        let broker = identity("bloom-broker", 2);
+        let signer = identity("bloom-signer", 3);
+        let session_acl = acl(&session, uid);
+        let peers = [acl(&broker, uid), acl(&signer, uid)];
+
+        let (client, server) = tokio::join!(
+            authenticate_client(&mut signer_stream, &signer, &session_acl),
+            authenticate_server_one_of(&mut session_stream, &session, &peers),
+        );
+        client.unwrap();
+        assert_eq!(server.unwrap().service_id.as_str(), "bloom-signer");
+    }
+
+    #[tokio::test]
+    async fn closed_peer_set_rejects_unpinned_identity_on_allowed_uid() {
+        let (mut foreign_stream, mut session_stream) = UnixStream::pair().unwrap();
+        let uid = foreign_stream.peer_cred().unwrap().uid();
+        let session = identity("bloom-session", 4);
+        let broker = identity("bloom-broker", 2);
+        let foreign = identity("foreign-service", 9);
+        let session_acl = acl(&session, uid);
+        let peers = [acl(&broker, uid)];
+
+        let server = tokio::spawn(async move {
+            authenticate_server_one_of(&mut session_stream, &session, &peers).await
+        });
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            authenticate_client(&mut foreign_stream, &foreign, &session_acl),
+        )
+        .await;
+        drop(foreign_stream);
+        let server = server.await.unwrap();
+        assert!(matches!(
+            server,
+            Err(ProtocolError {
+                code: ProtocolErrorCode::UnauthenticatedPeer,
+                ..
+            })
+        ));
+        assert!(!matches!(client, Ok(Ok(()))));
     }
 
     #[tokio::test]

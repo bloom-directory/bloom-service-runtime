@@ -5,12 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+triad-dev-harness = []
+
 [dependencies]
 bloom-triad-protocol.workspace = true
 bloom-trusted-time.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 rand.workspace = true
+rustix = { workspace = true, features = ["process"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true
@@ -18,4 +22,5 @@ sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "net"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -18,6 +18,15 @@ fn release_script(name: &str) -> PathBuf {
 }
 
 #[test]
+fn production_provenance_catalog_has_no_retired_native_hyperliquid_authority() {
+    let catalog = fs::read_to_string(
+        workspace().join("packaging/triad/macos/config/provenance-catalog.unsigned.json"),
+    )
+    .unwrap();
+    assert!(!catalog.contains("hyperliquid."));
+}
+
+#[test]
 fn machine_authority_boundary_baseline_is_ratcheted_and_strict_release_is_blocked() {
     let release_dir = workspace().join("packaging/triad/release");
     let tested = Command::new(release_dir.join("test-machine-authority-boundary.sh"))
@@ -113,6 +122,37 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
         .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
         .output()
         .unwrap()
+}
+
+#[test]
+fn release_bundle_rejects_triad_developer_harness_artifacts() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    // This environment-variable name is intentionally present in every
+    // dev-feature service binary: it selects the user-owned identity loader.
+    // Put it in the executable fixture rather than an adjacent metadata file
+    // so this test models the actual accidental-packaging failure mode.
+    fs::write(
+        staging.join("bin/bloom-broker"),
+        b"#!/bin/sh\n# BLOOM_TRIAD_DEVELOPER_ROOT\necho bloom-broker 0.1.0\n",
+    )
+    .unwrap();
+    let rejected = build(
+        &staging,
+        &directory.path().join("rejected.tar.gz"),
+        &directory.path().join("unused-key"),
+    );
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("forbidden production artifact marker: BLOOM_TRIAD_DEVELOPER_ROOT"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
+    assert!(!launcher.contains("--local-integration"));
+    assert!(!launcher.contains("--features local-integration"));
 }
 
 fn macos_subject(payload: &Path) -> std::process::Output {
