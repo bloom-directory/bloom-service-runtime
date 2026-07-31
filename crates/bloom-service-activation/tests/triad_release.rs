@@ -274,6 +274,7 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
         "chown \"$signer_socket_dir_owner:$signer_socket_dir_group\"",
         "chmod \"$signer_socket_dir_mode\" \"$signer_socket_dir\"",
         "packaged production Machine service",
+        "packaged Machine runtime negative failed at line",
         "lsof -nP -a -p",
         "-name auth",
         "-name auth.sqlite",
