@@ -17,6 +17,22 @@ fn release_script(name: &str) -> PathBuf {
     workspace().join("packaging/triad/release").join(name)
 }
 
+#[test]
+fn machine_authority_boundary_baseline_is_ratcheted_and_strict_release_is_blocked() {
+    let release_dir = workspace().join("packaging/triad/release");
+    let tested = Command::new(release_dir.join("test-machine-authority-boundary.sh"))
+        .output()
+        .unwrap();
+    assert!(
+        tested.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tested.stderr)
+    );
+
+    let release_gate = fs::read_to_string(release_dir.join("triad-release-gate.sh")).unwrap();
+    assert!(release_gate.contains("check-machine-authority-boundary.sh\" --require-clean"));
+}
+
 fn generate_ed25519_key(path: &Path) {
     assert!(
         Command::new("/usr/bin/ssh-keygen")
