@@ -513,6 +513,17 @@ fn activating_enrollment_is_private_to_installer_health_and_session_bootstrap() 
     let machine = fs::read_to_string(workspace().join("crates/bloom/src/main.rs")).unwrap();
     assert!(machine.contains("allow_activating"));
     assert!(machine.contains("installed Bloom enrollment is not active"));
+    for required in [
+        "open_configured_machine_audit_with_activation",
+        "configured_machine_checkpoint_path_with_activation",
+        "configured_authority_edge_history_path_with_activation",
+        "configured_machine_audit_history_path_with_activation",
+    ] {
+        assert!(
+            machine.contains(required),
+            "activation health does not carry its narrow enrollment allowance through {required}"
+        );
+    }
     let sentinel =
         fs::read_to_string(workspace().join("crates/bloom/src/session_sentinel.rs")).unwrap();
     assert!(sentinel.contains("Some(\"activating\" | \"active\")"));
