@@ -372,7 +372,9 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
         "result_details.get(\"outcome\") == \"error\"",
         "audit status",
         "bloom-broker-debug-driver",
-        "wallet projection ma05-cached",
+        "wallet_id=\"$(jq -r '.wallet_id // empty'",
+        "[[ \"$wallet_id\" =~ ^wallet-[0-9a-f]{24}$ ]]",
+        "wallet projection \"$wallet_id\"",
         "wallet commit-policy",
         "authenticated-projection-cache.json",
         "chown \"$login_uid\" \"$runtime/machine\"",
@@ -411,6 +413,11 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
             "packaged runtime negative omits {required}"
         );
     }
+    assert_eq!(
+        negative.matches("ma05-cached").count(),
+        1,
+        "the requested Machine wallet label must not be reused as the Signer-originated wallet ID"
+    );
 }
 
 #[test]
