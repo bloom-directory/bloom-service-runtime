@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 fn workspace() -> PathBuf {
@@ -396,7 +397,12 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
         "audit_signing_seed_hex",
         "audit_historical_public_keys",
         "audit_rotation_previous_key",
-        "plutil -extract \"$field\" json",
+        "extract_json_config_field",
+        "set_json_config_field",
+        "/usr/bin/osascript -l JavaScript",
+        "JSON.parse(text)",
+        "writeToFileAtomically(argv[0], true)",
+        "validate_json_config \"$new_config\"",
         "authority-edge-history.json",
         "write_rotation_phase quiesced",
         "finalize_transport_handover_history",
@@ -408,7 +414,6 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
         "historical_keys.0",
         "handovers.0",
         "bloom.authority-edge-application-history.1",
-        "plutil -convert json -o /dev/null -- \"$new_config\"",
         "atomic_copy_preserving_metadata",
         "health_check_enrollment",
         "prepare_transport_rotation",
@@ -420,6 +425,8 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
             "macOS installer is missing config-rotation invariant {required}"
         );
     }
+    assert!(!source.contains("read_enrollment_field \"$staged/broker.json\" build_digest"));
+    assert!(!source.contains("read_enrollment_field \"$staged/signer.json\" build_digest"));
 
     let recovery = source
         .split("recover_interrupted_rotation() {")
@@ -485,6 +492,54 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
             .contains("expected_normalized=\"$(plutil -convert xml1 -o - \"$expected_record\")\"")
     );
     assert!(source.contains("[[ \"$source_normalized\" == \"$expected_normalized\" ]]"));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_json_config_helpers_accept_the_null_bearing_signer_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let installer =
+        fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
+    let helpers = installer
+        .split("extract_json_config_field() {")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("\nrequire_network_containment_config() {")
+                .next()
+        })
+        .map(|body| format!("extract_json_config_field() {{{body}"))
+        .expect("extract JSON config helper definitions");
+    let temp = tempfile::tempdir().unwrap();
+    let signer_config = temp.path().join("signer.json");
+    let signer_template =
+        fs::read_to_string(workspace().join("packaging/triad/macos/config/signer.json.in"))
+            .unwrap();
+    fs::write(&signer_config, signer_template.replace("@LOGIN_UID@", "42")).unwrap();
+    fs::set_permissions(&signer_config, fs::Permissions::from_mode(0o600)).unwrap();
+    let command = format!(
+        "set -e\n\
+         {helpers}\n\
+         extract_json_config_field \"$1\" audit_rotation_previous_key raw\n\
+         set_json_config_field \"$1\" network_containment \
+           '{{\"status_path\":\"/private/var/run/bloom/43/containment/status.json\",\"login_uid\":43,\"maximum_age_ms\":5000}}'\n\
+         extract_json_config_field \"$1\" network_containment.login_uid raw"
+    );
+    let output = Command::new("/bin/bash")
+        .args(["-c", &command, "--"])
+        .arg(&signer_config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "JSON config helpers failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "null\n43\n");
+    assert_eq!(
+        fs::metadata(&signer_config).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 #[test]
