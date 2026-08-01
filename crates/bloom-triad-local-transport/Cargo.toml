@@ -22,5 +22,6 @@ sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "net"] }
 
 [dev-dependencies]
+bloom-audit-checkpoint.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

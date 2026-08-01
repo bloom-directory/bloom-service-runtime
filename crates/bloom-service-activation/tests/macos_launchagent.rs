@@ -389,6 +389,22 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
         "rollback_rotation",
         "recover_interrupted_rotation",
         "config rotation may not change",
+        "audit_key_id",
+        "audit_signing_seed_hex",
+        "audit_historical_public_keys",
+        "audit_rotation_previous_key",
+        "plutil -extract \"$field\" json",
+        "authority-edge-history.json",
+        "write_rotation_phase quiesced",
+        "finalize_transport_handover_history",
+        "consistent_checkpoint_tuple",
+        "append_transport_handover",
+        "roll_forward_transport_rotation",
+        "phase\" == \"switched\" || \"$phase\" == \"activating",
+        "expected_key_id",
+        "historical_keys.0",
+        "handovers.0",
+        "bloom.authority-edge-application-history.1",
         "plutil -convert json -o /dev/null -- \"$new_config\"",
         "atomic_copy_preserving_metadata",
         "health_check_enrollment",
@@ -413,6 +429,44 @@ fn macos_config_rotation_is_journaled_verified_and_recoverable() {
     assert!(recovery.ends_with("return 0"));
 
     assert!(source.contains("if ! $restoring_retained; then"));
+    let w0 =
+        fs::read_to_string(workspace().join("packaging/triad/macos/w0/run-disposable.sh")).unwrap();
+    for required in [
+        "interrupted_identity_rotation_pid",
+        "kill -STOP \"$interrupted_identity_rotation_pid\"",
+        "new application keys have",
+        "staged_edge_digest",
+        "post-activation identity recovery rolled back instead of forward",
+    ] {
+        assert!(w0.contains(required));
+    }
+    let identity_rotation = w0
+        .find("\"$installer\" rotate-identities / \"$login_uid\" &")
+        .unwrap();
+    let stopped = identity_rotation
+        + w0[identity_rotation..]
+            .find("kill -STOP \"$interrupted_identity_rotation_pid\"")
+            .unwrap();
+    let new_key_health = stopped + w0[stopped..].find("--triad-health-check").unwrap();
+    let killed = new_key_health
+        + w0[new_key_health..]
+            .find("kill -9 \"$interrupted_identity_rotation_pid\"")
+            .unwrap();
+    let recovered = killed
+        + w0[killed..]
+            .find("\"$installer\" rotate-config / \"$login_uid\" broker")
+            .unwrap();
+    let roll_forward_assertion = recovered
+        + w0[recovered..]
+            .find("post-activation identity recovery rolled back instead of forward")
+            .unwrap();
+    assert!(
+        identity_rotation < stopped
+            && stopped < new_key_health
+            && new_key_health < killed
+            && killed < recovered
+            && recovered < roll_forward_assertion
+    );
     assert_ordered(
         &source,
         &[

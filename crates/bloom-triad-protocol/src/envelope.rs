@@ -63,7 +63,8 @@ pub struct UnsignedEnvelope<T> {
     pub body: T,
     pub application_key_id: Token,
     /// Independently signed sender audit head. Protocol minor 1 requires this
-    /// on the Broker-Signer edge and forbids it on every other edge.
+    /// on both authority edges (Machine-Broker and Broker-Signer) and forbids
+    /// it on every other edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_journal_head: Option<SignedJournalHead>,
 }
@@ -209,20 +210,20 @@ impl<T: Serialize> SignedEnvelope<T> {
         &self,
         expected: &AuthenticatedPeer,
     ) -> Result<(), ProtocolError> {
-        let broker_signer_edge = is_broker_signer_edge(
+        let authority_edge = is_authority_edge(
             self.unsigned.caller_service_id.as_str(),
             self.unsigned.audience.as_str(),
         );
         if self.unsigned.protocol.minor == 0 {
-            if self.unsigned.sender_journal_head.is_some() || broker_signer_edge {
+            if self.unsigned.sender_journal_head.is_some() || authority_edge {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::UnsupportedVersion,
-                    "Broker-Signer journal heads require protocol minor 1 without downgrade",
+                    "authority-edge journal heads require protocol minor 1 without downgrade",
                 ));
             }
             return Ok(());
         }
-        match (&self.unsigned.sender_journal_head, broker_signer_edge) {
+        match (&self.unsigned.sender_journal_head, authority_edge) {
             (Some(head), true) => head.verify_sender_identity(
                 &self.unsigned.caller_service_id,
                 &self.unsigned.application_key_id,
@@ -230,11 +231,11 @@ impl<T: Serialize> SignedEnvelope<T> {
             ),
             (None, true) => Err(ProtocolError::new(
                 ProtocolErrorCode::UnauthenticatedPeer,
-                "Broker-Signer envelope omitted its signed sender journal head",
+                "authority-edge envelope omitted its signed sender journal head",
             )),
             (Some(_), false) => Err(ProtocolError::new(
                 ProtocolErrorCode::UnauthenticatedPeer,
-                "sender journal heads are forbidden outside the Broker-Signer edge",
+                "sender journal heads are forbidden outside authority edges",
             )),
             (None, false) => Ok(()),
         }
@@ -263,10 +264,13 @@ impl<T: Serialize> SignedEnvelope<T> {
     }
 }
 
-fn is_broker_signer_edge(caller: &str, audience: &str) -> bool {
+fn is_authority_edge(caller: &str, audience: &str) -> bool {
     matches!(
         (caller, audience),
-        ("bloom-broker", "bloom-signer") | ("bloom-signer", "bloom-broker")
+        ("bloom-machine", "bloom-broker")
+            | ("bloom-broker", "bloom-machine")
+            | ("bloom-broker", "bloom-signer")
+            | ("bloom-signer", "bloom-broker")
     )
 }
 
@@ -405,7 +409,7 @@ mod tests {
             deadline_ms: DecimalU64::new(20),
             body,
             application_key_id: Token::new("machine-app").unwrap(),
-            sender_journal_head: None,
+            sender_journal_head: Some(journal_head(&signing_key, "bloom-machine", "machine-app")),
         };
         let envelope = SignedEnvelope {
             signature: Base64UrlBytes::from_bytes(

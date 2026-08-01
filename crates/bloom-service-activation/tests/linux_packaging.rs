@@ -200,8 +200,15 @@ fn audit_checkpoint_roots_are_principal_private_and_explicitly_wired() {
         )));
         let service = source(&format!("systemd/bloom-{principal}@.service.in"));
         assert!(service.contains(&format!(
-            "Environment=BLOOM_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/{principal}/audit-checkpoints"
+            "Environment=BLOOM_{}_AUDIT_CHECKPOINT_DIR=/var/lib/bloom/%i/{principal}/audit-checkpoints",
+            principal.to_ascii_uppercase()
         )));
+        assert!(service.contains(
+            "Environment=BLOOM_AUTHORITY_EDGE_HISTORY=/etc/bloom/%i/authority-edge-history.json"
+        ));
         assert!(!service.contains("../"));
     }
+    assert!(temporary_paths.contains(
+        "d /var/lib/bloom/@LOGIN_UID@/machine/audit-checkpoints 0700 @LOGIN_USER@ @LOGIN_USER@ -"
+    ));
 }

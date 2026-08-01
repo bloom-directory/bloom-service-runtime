@@ -155,6 +155,39 @@ fn build(staging: &Path, output: &Path, key: &Path) -> std::process::Output {
 }
 
 #[test]
+fn release_bundle_excludes_source_only_macos_w0_tooling() {
+    let script = fs::read_to_string(release_script("build-bundle.sh")).unwrap();
+    assert!(script.contains("macos_input"));
+    assert!(script.contains("== \"w0\""));
+
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    let key = directory.path().join("release-key");
+    let archive = directory.path().join("bundle.tar.gz");
+    generate_ed25519_key(&key);
+    let built = build(&staging, &archive, &key);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let listed = Command::new("tar")
+        .args(["-tzf"])
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let entries = String::from_utf8(listed.stdout).unwrap();
+    assert!(entries.contains("bloom-triad/installer/macos/README.md"));
+    assert!(
+        !entries
+            .lines()
+            .any(|entry| entry.starts_with("bloom-triad/installer/macos/w0/")),
+        "source-only W0 tooling entered the production bundle:\n{entries}"
+    );
+}
+
+#[test]
 fn release_bundle_rejects_triad_developer_harness_artifacts() {
     let directory = tempfile::tempdir().unwrap();
     let staging = make_staging(directory.path());
@@ -183,6 +216,37 @@ fn release_bundle_rejects_triad_developer_harness_artifacts() {
     let launcher = fs::read_to_string(workspace().join("scripts/triad-dev-launch.sh")).unwrap();
     assert!(!launcher.contains("--local-integration"));
     assert!(!launcher.contains("--features local-integration"));
+}
+
+#[test]
+fn production_release_rejects_machine_audit_test_features() {
+    let gate =
+        fs::read_to_string(workspace().join("packaging/triad/release/triad-release-gate.sh"))
+            .expect("read release gate");
+    let bundle = fs::read_to_string(workspace().join("packaging/triad/release/build-bundle.sh"))
+        .expect("read bundle builder");
+    let checker = fs::read_to_string(
+        workspace().join("packaging/triad/release/check-machine-authority-boundary.sh"),
+    )
+    .expect("read production feature-set checker");
+    let checker_tests = fs::read_to_string(
+        workspace().join("packaging/triad/release/test-machine-authority-boundary.sh"),
+    )
+    .expect("read production feature-set checker tests");
+    for forbidden in ["unsigned-audit-test-seam", "audit-test-seam"] {
+        assert!(gate.contains(forbidden));
+        assert!(bundle.contains(forbidden));
+        assert!(checker.contains(&format!("'*:{forbidden}'")));
+    }
+    assert!(checker_tests.contains("for audit_feature in audit-test-seam"));
+    assert!(checker_tests.contains("forbidden-unsigned-audit-seam"));
+    assert!(checker_tests.contains("bloom-daemon:unsigned-audit-test-seam"));
+    assert!(gate.contains("forbidden production Machine feature resolved"));
+    assert!(gate.contains("cargo tree"));
+    assert!(gate.contains("-e normal,build,features"));
+    assert!(checker_tests.contains("BLOOM_MACHINE_METADATA_FIXTURE"));
+    assert!(checker_tests.contains("BLOOM_MACHINE_FEATURE_TREE_FIXTURE"));
+    assert!(checker_tests.contains("forbidden resolved Machine feature"));
 }
 
 #[test]
@@ -217,7 +281,7 @@ fn release_bundle_rejects_legacy_machine_authority_symbols_or_strings() {
     let staging = make_staging(directory.path());
     fs::write(
         staging.join("bin/bloom"),
-        b"#!/bin/sh\n# PrivateKeySigner\necho bloom 0.1.3\n",
+        b"#!/bin/sh\n# KeystorePetalHost\necho bloom 0.1.3\n",
     )
     .unwrap();
 
@@ -229,7 +293,7 @@ fn release_bundle_rejects_legacy_machine_authority_symbols_or_strings() {
     assert!(!rejected.status.success());
     assert!(
         String::from_utf8_lossy(&rejected.stderr)
-            .contains("forbidden production Machine artifact marker: PrivateKeySigner"),
+            .contains("forbidden production Machine artifact marker: KeystorePetalHost"),
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
     );
@@ -256,7 +320,7 @@ fn release_bundle_allows_signer_authority_but_rejects_machine_owned_authority() 
     fs::create_dir_all(staging.join("machine/plugins")).unwrap();
     fs::write(
         staging.join("machine/plugins/authority.txt"),
-        b"PrivateKeySigner\n",
+        b"KeystorePetalHost\n",
     )
     .unwrap();
     let rejected = build(
@@ -267,7 +331,7 @@ fn release_bundle_allows_signer_authority_but_rejects_machine_owned_authority() 
     assert!(!rejected.status.success());
     assert!(
         String::from_utf8_lossy(&rejected.stderr)
-            .contains("forbidden production Machine artifact marker: PrivateKeySigner"),
+            .contains("forbidden production Machine artifact marker: KeystorePetalHost"),
         "{}",
         String::from_utf8_lossy(&rejected.stderr)
     );
@@ -285,14 +349,32 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
     );
 
     let negative = fs::read_to_string(w0.join("run-packaged-machine-negative.sh")).unwrap();
+    assert!(
+        !negative.contains("ipc call write"),
+        "MA-05 authority negatives must be driven only through the kernel mount"
+    );
     for required in [
         "serve",
         "hostile-unix-listener",
         "BLOOM_BROKER_SOCKET",
         "default_chain = \"anvil\"",
         "[chains.anvil]",
-        "rpc_urls = [\"http://127.0.0.1:1\"]",
-        "allow_broadcast = false",
+        "rpc_urls = [",
+        "$rpc_port",
+        "allow_broadcast = true",
+        "BLOOM_MA05_LEGACY_AUTHORITY_POISON",
+        "legacy-before.manifest",
+        "/usr/bin/fs_usage -w -f pathname >",
+        "bloom\\.[0-9]+",
+        "machine.effect.intent",
+        "machine.effect.result",
+        "payload_sha256",
+        "result_details.get(\"outcome\") == \"error\"",
+        "audit status",
+        "bloom-broker-debug-driver",
+        "wallet projection ma05-cached",
+        "wallet commit-policy",
+        "authenticated-projection-cache.json",
         "chown \"$login_uid\" \"$runtime/machine\"",
         "machine_socket=\"$runtime/machine/machine.sock\"",
         "system/com.bloom.signer.$login_uid",
@@ -310,9 +392,18 @@ fn installed_acceptance_runs_the_packaged_machine_runtime_negative() {
         "lsof -nP -a -p",
         "-name auth",
         "-name auth.sqlite",
+        "$clean_home/auth",
+        "$clean_home/auth/challenges",
+        "$clean_home/auth/grants",
+        "for root in \"${legacy_poison_roots[@]}\"",
         "policy-session",
         "signer-cache",
-        "did not fail the hostile Broker projection promptly",
+        "did not preserve cached reads through its kernel mount",
+        "did not expose a completed mounted simulation",
+        "simulation did not return the deterministic fixture result",
+        "did not identify the unavailable authenticated Broker edge",
+        "accessed, migrated, or changed poisoned legacy authority state",
+        "attempted to access poisoned legacy authority root",
         "connected directly to the hostile Signer sentinel",
     ] {
         assert!(
@@ -686,6 +777,27 @@ fn release_scan_rejects_debug_or_accepting_artifacts() {
 }
 
 #[test]
+fn release_scan_rejects_ma08_secret_artifact_probe() {
+    let directory = tempfile::tempdir().unwrap();
+    let staging = make_staging(directory.path());
+    fs::write(
+        staging.join("bin/bloom-machine"),
+        b"assert-machine-secret-confinement",
+    )
+    .unwrap();
+    let built = build(
+        &staging,
+        &directory.path().join("forbidden-ma08-probe.tar.gz"),
+        &directory.path().join("unused-key"),
+    );
+    assert!(!built.status.success());
+    assert!(
+        String::from_utf8_lossy(&built.stderr)
+            .contains("forbidden production artifact marker: assert-machine-secret-confinement")
+    );
+}
+
+#[test]
 fn release_scan_rejects_empty_debug_artifacts_globally() {
     let directory = tempfile::tempdir().unwrap();
     let staging = make_staging(directory.path());
@@ -793,8 +905,58 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
             .exists()
     );
 
+    fs::write(
+        payload.join("config/broker-identity.json"),
+        b"{\"changed\":true}",
+    )
+    .unwrap();
+    let changed_identity = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["1000", "alice"])
+        .arg(&payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .output()
+        .unwrap();
+    assert!(!changed_identity.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed_identity.stderr)
+            .contains("may not replace transport identities")
+    );
+    assert_eq!(
+        fs::read(root.join("etc/bloom/1000/broker/identity.json")).unwrap(),
+        b"{}"
+    );
+    fs::write(payload.join("config/broker-identity.json"), b"{}").unwrap();
+
+    let payload_manifest = fs::read(payload.join("config/edge-manifest.json")).unwrap();
+    let installed_manifest = fs::read(root.join("etc/bloom/1000/edge-manifest.json")).unwrap();
+    fs::write(
+        payload.join("config/edge-manifest.json"),
+        b"{\"changed\":true}",
+    )
+    .unwrap();
+    let changed_manifest = Command::new(&installer)
+        .args(["install"])
+        .arg(&root)
+        .args(["1000", "alice"])
+        .arg(&payload)
+        .env("BLOOM_ALLOW_TEST_UNCLAIMED", "true")
+        .output()
+        .unwrap();
+    assert!(!changed_manifest.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed_manifest.stderr)
+            .contains("may not replace transport identities")
+    );
+    assert_eq!(
+        fs::read(root.join("etc/bloom/1000/edge-manifest.json")).unwrap(),
+        installed_manifest
+    );
+    fs::write(payload.join("config/edge-manifest.json"), payload_manifest).unwrap();
+
     let rotated = directory.path().join("rotated.json");
-    fs::write(&rotated, b"{\"rotated\":true}").unwrap();
+    fs::write(&rotated, b"{\"maximum_connections\":63}").unwrap();
     assert!(
         Command::new(&installer)
             .args(["rotate-config"])
@@ -807,8 +969,34 @@ fn linux_installer_upgrade_rotation_and_confirmed_uninstall_are_staged_safely() 
     );
     assert_eq!(
         fs::read(root.join("etc/bloom/1000/signer/config.json")).unwrap(),
-        b"{\"rotated\":true}"
+        b"{\"maximum_connections\":63}"
     );
+
+    for (principal, forbidden) in [
+        ("broker", "{\"audit_key_id\":\"substituted\"}"),
+        ("signer", "{\"audit_historical_public_keys\":[]}"),
+    ] {
+        let installed_config =
+            fs::read(root.join(format!("etc/bloom/1000/{principal}/config.json"))).unwrap();
+        let replacement = directory.path().join(format!("{principal}-forbidden.json"));
+        fs::write(&replacement, forbidden).unwrap();
+        let rejected = Command::new(&installer)
+            .args(["rotate-config"])
+            .arg(&root)
+            .args(["1000", principal])
+            .arg(&replacement)
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("may not change authority or identity field")
+        );
+        assert_eq!(
+            fs::read(root.join(format!("etc/bloom/1000/{principal}/config.json"))).unwrap(),
+            installed_config
+        );
+    }
 
     assert!(
         !Command::new(&installer)
@@ -853,10 +1041,14 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
     );
     let broker_plist = root.join("Library/LaunchDaemons/com.bloom.broker.501.plist");
     let signer_plist = root.join("Library/LaunchDaemons/com.bloom.signer.501.plist");
-    for plist in [&broker_plist, &signer_plist] {
+    for (service, plist) in [("broker", &broker_plist), ("signer", &signer_plist)] {
         let source = fs::read_to_string(plist).unwrap();
         assert!(!source.contains("@BLOOM_"));
-        assert!(source.contains("BLOOM_AUDIT_CHECKPOINT_DIR"));
+        assert!(source.contains(&format!(
+            "BLOOM_{}_AUDIT_CHECKPOINT_DIR",
+            service.to_ascii_uppercase()
+        )));
+        assert!(source.contains("BLOOM_AUTHORITY_EDGE_HISTORY"));
         assert!(source.contains("<key>UserName</key>"));
         assert_eq!(
             fs::metadata(plist).unwrap().permissions().mode() & 0o777,
@@ -893,6 +1085,19 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
             & 0o777,
         0o700
     );
+    assert_eq!(
+        fs::metadata(root.join("var/db/bloom/501/machine/audit-checkpoints"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let authority_history = fs::read_to_string(
+        root.join("Library/Application Support/BloomTriad/config/501/authority-edge-history.json"),
+    )
+    .unwrap();
+    assert!(authority_history.contains("bloom.authority-edge-application-history.1"));
     let edge_manifest = fs::read_to_string(
         root.join("Library/Application Support/BloomTriad/config/501/edge-manifest.json"),
     )
