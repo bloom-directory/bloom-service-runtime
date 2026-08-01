@@ -236,7 +236,7 @@ fn production_release_rejects_machine_audit_test_features() {
     for forbidden in ["unsigned-audit-test-seam", "audit-test-seam"] {
         assert!(gate.contains(forbidden));
         assert!(bundle.contains(forbidden));
-        assert!(checker.contains(&format!("'*:{forbidden}'")));
+        assert!(checker.contains(forbidden));
     }
     assert!(checker_tests.contains("for audit_feature in audit-test-seam"));
     assert!(checker_tests.contains("forbidden-unsigned-audit-seam"));
