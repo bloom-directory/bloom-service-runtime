@@ -635,7 +635,6 @@ impl CheckpointStore {
 
     fn valid_handover(&self, old: &SignedJournalHead, new: &SignedJournalHead) -> bool {
         old.service_id == new.service_id
-            && old.sequence == new.sequence
             && self
                 .handovers
                 .get(&(new.service_id.clone(), new.key_id.clone()))
@@ -1379,6 +1378,30 @@ mod tests {
             open_rotated_store(&directory, false, None),
             Err(CheckpointError::UnpinnedPeer)
         ));
+    }
+
+    #[test]
+    fn first_observed_rotated_head_may_advance_past_handover() {
+        let directory = tempfile::tempdir().unwrap();
+        let old_store = open_store(&directory);
+        old_store.append(&head(7, "11")).unwrap();
+        drop(old_store);
+
+        let handover = ApplicationKeyHandover {
+            service_id: Token::new("bloom-signer").unwrap(),
+            old_key_id: Token::new("signer-audit-1").unwrap(),
+            new_key_id: Token::new("signer-app-2").unwrap(),
+            sequence: DecimalU64::new(7),
+            head_hash: Digest32::new("11".repeat(32)).unwrap(),
+        };
+        let rotated = open_rotated_store(&directory, true, Some(handover.clone())).unwrap();
+        let first_observed = keyed_head(&rotated_signing_key(), "signer-app-2", 10, "22");
+        assert_eq!(
+            rotated.append(&first_observed).unwrap(),
+            AppendOutcome::Appended
+        );
+        drop(rotated);
+        assert!(open_rotated_store(&directory, true, Some(handover)).is_ok());
     }
 
     #[test]
