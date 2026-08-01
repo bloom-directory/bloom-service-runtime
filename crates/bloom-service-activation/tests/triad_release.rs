@@ -454,6 +454,13 @@ fn tart_bundle_build_runs_strict_machine_boundary_before_compilation() {
     assert!(runner.contains("$bundled_revision\" != \"$revision"));
     assert!(runner.contains("--dir=\"output:$local_output_root\""));
     assert!(!runner.contains("--dir=\"bloom:$main_root:ro\""));
+    assert!(runner.contains("sleep 60"));
+    assert!(runner.contains("if printf '%s\\n'"));
+    assert!(runner.contains("'set -e'"));
+    assert!(runner.contains("for _fork_probe in {1..200}"));
+    assert!(runner.contains("/usr/bin/python3 -c \"pass\""));
+    assert!(runner.contains("\"admin@$guest_ip\" /bin/bash -s"));
+    assert!(!runner.contains("/bin/bash -c"));
 
     let execution = fs::read_to_string(w0.join("tart-run-guest.sh")).unwrap();
     assert!(
