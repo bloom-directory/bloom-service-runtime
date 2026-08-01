@@ -418,8 +418,12 @@ fn tart_bundle_build_runs_strict_machine_boundary_before_compilation() {
     let w0 = workspace().join("packaging/triad/macos/w0");
     let source = fs::read_to_string(w0.join("tart-build-guest.sh")).unwrap();
     let boundary = source
-        .find("check-machine-authority-boundary.sh\" \\\n  --require-clean")
+        .find("check-machine-authority-boundary.sh")
         .expect("Tart build must invoke the strict Machine authority boundary");
+    assert!(
+        source[boundary..]
+            .starts_with("check-machine-authority-boundary.sh\" \\\n      --require-clean")
+    );
     let cargo_build = source
         .find("cargo build")
         .expect("Tart build must compile production binaries");
@@ -434,6 +438,9 @@ fn tart_bundle_build_runs_strict_machine_boundary_before_compilation() {
         boundary < bundle_build,
         "boundary check must precede bundle assembly"
     );
+    assert!(source.contains("for attempt in 1 2 3"));
+    assert!(source.contains("if (( status <= 128 ))"));
+    assert!(source.contains("terminated by signal"));
     assert!(source.contains("git clone --quiet \"$bundle\" \"$temporary\""));
     assert!(source.contains("git -C \"$temporary\" fsck --no-dangling"));
     assert!(source.contains("[[ ! -L \"$local_source_root\" ]]"));
