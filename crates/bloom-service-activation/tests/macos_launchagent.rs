@@ -276,6 +276,9 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
     }
     assert!(!source.contains("macos-rootless-code-identity"));
     assert!(!source.contains("com.apple.security.application-groups"));
+    assert!(source.contains("if observed=\"$("));
+    assert!(source.contains("elif observed=\"$("));
+    assert!(!source.contains("<<<\"$record\" 2>/dev/null || true"));
 }
 
 #[test]
