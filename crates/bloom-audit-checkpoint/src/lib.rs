@@ -86,6 +86,7 @@ pub struct CheckpointStore {
     recipient_service_id: Token,
     peer_keys: BTreeMap<Token, PeerKeySet>,
     handovers: BTreeMap<(Token, Token), ApplicationKeyHandover>,
+    operation: Mutex<()>,
     state: Mutex<CheckpointState>,
     #[cfg(test)]
     scan_count: AtomicU64,
@@ -237,6 +238,7 @@ impl CheckpointStore {
             recipient_service_id,
             peer_keys,
             handovers: handover_map,
+            operation: Mutex::new(()),
             state: Mutex::new(CheckpointState {
                 root_stamp: initial_root_stamp,
                 latest: BTreeMap::new(),
@@ -253,6 +255,10 @@ impl CheckpointStore {
     }
 
     pub fn append(&self, peer_head: &SignedJournalHead) -> Result<AppendOutcome, CheckpointError> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CheckpointError::Malformed("checkpoint operation lock poisoned".into()))?;
         self.verify_live_head(peer_head)?;
         if self.cached_head_is_exact(peer_head)? {
             return Ok(AppendOutcome::AlreadyPresent);
@@ -353,6 +359,10 @@ impl CheckpointStore {
     }
 
     pub fn latest(&self, service_id: &Token) -> Result<Option<SignedJournalHead>, CheckpointError> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| CheckpointError::Malformed("checkpoint operation lock poisoned".into()))?;
         let stamp = root_stamp(&self.root, self.expected_uid)?;
         let cached = {
             let state = self.lock_state()?;
@@ -1170,6 +1180,86 @@ mod tests {
             reopened.append(&expected).unwrap(),
             AppendOutcome::AlreadyPresent
         );
+    }
+
+    #[test]
+    fn one_recipient_serializes_concurrent_peer_head_advances() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = fs::metadata(directory.path()).unwrap().uid();
+        let peers = [
+            (
+                "bloom-machine",
+                "machine-app",
+                SigningKey::from_bytes(&[11; 32]),
+            ),
+            (
+                "bloom-broker",
+                "broker-app",
+                SigningKey::from_bytes(&[12; 32]),
+            ),
+            (
+                "bloom-signer",
+                "signer-app",
+                SigningKey::from_bytes(&[13; 32]),
+            ),
+        ];
+        let service_ids = ["bloom-machine", "bloom-broker", "bloom-signer"];
+        let store = std::sync::Arc::new(
+            CheckpointStore::open(
+                directory.path(),
+                uid,
+                Token::new("bloom-broker").unwrap(),
+                peers
+                    .iter()
+                    .map(|(service_id, key_id, signing_key)| PinnedAuditKey {
+                        service_id: Token::new(*service_id).unwrap(),
+                        key_id: Token::new(*key_id).unwrap(),
+                        verifying_key: signing_key.verifying_key(),
+                    }),
+            )
+            .unwrap(),
+        );
+        let start = std::sync::Arc::new(std::sync::Barrier::new(peers.len()));
+        let workers = peers
+            .into_iter()
+            .enumerate()
+            .map(|(peer_index, (service_id, key_id, signing_key))| {
+                let store = std::sync::Arc::clone(&store);
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for sequence in 1..=24 {
+                        let hash_byte = format!("{:02x}", (sequence + peer_index as u64) % 255);
+                        let mut head = SignedJournalHead {
+                            service_id: Token::new(service_id).unwrap(),
+                            sequence: DecimalU64::new(sequence),
+                            head_hash: Digest32::new(hash_byte.repeat(32)).unwrap(),
+                            key_id: Token::new(key_id).unwrap(),
+                            signature: Base64UrlBytes::from_bytes(&[0; 64]),
+                        };
+                        head.signature = Base64UrlBytes::from_bytes(
+                            &signing_key.sign(&head.signature_message()).to_bytes(),
+                        );
+                        store.append(&head).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        for service_id in service_ids {
+            assert_eq!(
+                store
+                    .latest(&Token::new(service_id).unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .sequence
+                    .get(),
+                24
+            );
+        }
     }
 
     #[test]
