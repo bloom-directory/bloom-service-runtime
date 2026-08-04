@@ -1,7 +1,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 fn workspace() -> PathBuf {
@@ -218,350 +217,92 @@ fn live_installer_provisions_fail_closed_directory_service_records() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
     for required in [
-        "require_live_macos_root",
-        "acquire_installer_lock",
-        "next_directory_id",
+        "live installation requires root on macOS",
+        "lock_installer",
+        "next_id",
         "refusing to adopt pre-existing user",
         "refusing to adopt pre-existing group",
-        "AuthenticationAuthority \";DisabledUser;\"",
-        "rollback_provisioning",
-        "verify_existing_enrollment",
+        "AuthenticationAuthority ';DisabledUser;'",
         "BLOOM_RELEASE_PUBLIC_KEY",
-        "pinned release key must be root-owned",
+        "pinned release key must be root owned",
         "--triad-render-macos-enrollment",
-        ".enrollment-templates.XXXXXX",
-        "$payload/installer/macos/config/$public_template",
-        "\"$template_staging\"",
-        "config_source=\"$generated_material\"",
-        "generated_macos_enrollment",
+        "$payload/installer/macos/config/",
         "dsmemberutil flushcache",
-        "require_effective_group_member",
-        "dscl -plist . -read",
-        "\"dsAttrTypeStandard:$attribute\".0",
-        "\"dsAttrTypeNative:$attribute\".0",
-        "chown \"$broker_user:$machine_broker_group\" \"$runtime_root/machine-broker\"",
-        "chown \"$signer_user:$broker_signer_group\" \"$runtime_root/broker-signer\"",
-        "chown root:wheel \"$runtime_root\" \"$runtime_root/containment\"",
-        "$runtime_root/revoke/broker",
-        "$runtime_root/revoke/signer",
+        "chown \"$broker_user:$machine_broker_group\" \"$runtime/machine-broker\"",
+        "chown \"$signer_user:$broker_signer_group\" \"$runtime/broker-signer\"",
+        "security directory is missing or substituted",
+        "ssh-keygen -Y verify",
+        "shasum -a 256 -c SHA256SUMS",
     ] {
         assert!(
             source.contains(required),
             "live installer is missing fail-closed input {required}"
         );
     }
-    for empty_recovery in [
-        r#"[[ -e "$upgrade_transaction" ]] || return 0"#,
-        r#"[[ -e "$transaction_root" ]] || return 0"#,
-        r#"[[ -e "$rotation_transaction" ]] || return 0"#,
-        r#"[[ -e "$uninstall_root" ]] || return 0"#,
-        r#"[[ -e "$retained_root" ]] || return 0"#,
-    ] {
-        assert!(
-            source.contains(empty_recovery),
-            "a clean first install must treat absent recovery state as success"
-        );
-    }
-    for bash3_unsafe_empty_array in [
-        r#""${pending_transactions[@]}""#,
-        r#""${abandoned_rotation_staging[@]}""#,
-        r#""${abandoned_uninstall_staging[@]}""#,
-        r#""${transactions[@]}""#,
-        r#""${retained_records[@]}""#,
-        r#""${installed_enrollment_files[@]}""#,
-    ] {
-        assert!(
-            !source.contains(bash3_unsafe_empty_array),
-            "macOS Bash 3.2 must not expand a possibly empty array under nounset"
-        );
-    }
     assert!(!source.contains("macos-rootless-code-identity"));
     assert!(!source.contains("com.apple.security.application-groups"));
-    assert!(source.contains("if observed=\"$("));
-    assert!(source.contains("elif observed=\"$("));
-    assert!(!source.contains("<<<\"$record\" 2>/dev/null || true"));
+    assert!(source.lines().count() < 500);
 }
 
 #[test]
-fn macos_upgrade_is_global_journaled_and_health_checked() {
+fn macos_installer_has_an_explicit_small_lifecycle() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
-    for required in [
-        "bloom.macos-upgrade-transaction.1",
-        "recover_interrupted_upgrade",
-        "prepare_upgrade_transaction",
-        "activate_upgrade_transaction",
-        "rollback_upgrade",
-        "installed enrollments do not share one complete release",
-        "stop_upgrade_jobs",
-        "restore_upgrade_files",
-        "health_check_upgrade_brokers_sequentially",
-        "active_session_uids",
-        "launchctl bootstrap system \"$broker_plist\"",
-        "--triad-health-check",
-        "install_immutable_release",
-        "bloom.macos-enrollment-transaction.1",
-        "recover_pending_enrollments",
-        "rollback_enrollment_transaction",
-        "publish_enrollment_active",
-        "stale Bloom installer lock",
-        "kill -0 \"$lock_pid\"",
+    assert!(source.lines().count() < 500);
+    assert!(source.contains("install ROOT LOGIN_UID LOGIN_USER PAYLOAD_DIR"));
+    assert!(source.contains("uninstall ROOT LOGIN_UID delete-bloom-login-LOGIN_UID"));
+    assert!(source.contains("in-place upgrades were removed"));
+    for removed in [
+        "rotate-config",
+        "rotate-identities",
+        "upgrade-transaction",
+        "rotation-transaction",
+        "retain-bloom-login",
     ] {
         assert!(
-            source.contains(required),
-            "macOS installer is missing upgrade invariant {required}"
+            !source.contains(removed),
+            "removed lifecycle leaked back into installer: {removed}"
         );
     }
-    assert!(!source.contains(
-        "macOS atomic release upgrade is not enabled until rollback health checks are implemented"
-    ));
-
-    let sequential = source
-        .split("health_check_upgrade_brokers_sequentially() {")
-        .nth(1)
-        .unwrap()
-        .split("\n}\n\nrestore_upgrade_files()")
-        .next()
-        .unwrap();
-    assert_ordered(
-        sequential,
-        &[
-            "active_session_uids",
-            "launchctl bootstrap system \"$broker_plist\"",
-            "--triad-health-check",
-            "launchctl bootout \"system/com.bloom.broker.$enrolled_uid\"",
-        ],
-    );
-
-    let activation = source
-        .split("activate_upgrade_transaction() {")
-        .nth(1)
-        .unwrap()
-        .split("\n}\n\ninstall_immutable_release()")
-        .next()
-        .unwrap();
-    assert_ordered(
-        activation,
-        &[
-            "restore_upgrade_jobs session",
-            "restore_upgrade_jobs signer",
-            "health_check_upgrade_brokers_sequentially \"$new_digest\"",
-            "restore_upgrade_jobs broker",
-            "write_upgrade_phase committed",
-        ],
-    );
-
-    let rollback = source
-        .split("rollback_upgrade() {")
-        .nth(1)
-        .unwrap()
-        .split("\n}\n\nrecover_interrupted_upgrade()")
-        .next()
-        .unwrap();
-    assert_ordered(
-        rollback,
-        &[
-            "restore_upgrade_jobs session",
-            "restore_upgrade_jobs signer",
-            "health_check_upgrade_brokers_sequentially \"$old_digest\"",
-            "restore_upgrade_jobs broker",
-        ],
-    );
-
-    let recovery = source
-        .split("recover_interrupted_upgrade() {")
-        .nth(1)
-        .unwrap()
-        .split("\n}\n\nprepare_upgrade_transaction()")
-        .next()
-        .unwrap();
-    assert!(recovery.contains("if $upgrade_in_progress; then"));
-    assert!(recovery.ends_with("return 0"));
 }
 
 #[test]
-fn macos_config_rotation_is_journaled_verified_and_recoverable() {
+fn macos_installer_does_not_hide_removed_lifecycle_logic() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
-    for required in [
-        "bloom.macos-config-rotation.1",
-        "bloom.macos-transport-rotation.1",
-        ".rotation-transaction.new.$$",
-        "verify_config_rotation",
-        "prepare_rotation",
-        "activate_rotation",
-        "rollback_rotation",
-        "recover_interrupted_rotation",
-        "config rotation may not change",
-        "audit_key_id",
-        "audit_signing_seed_hex",
-        "audit_historical_public_keys",
-        "audit_rotation_previous_key",
-        "extract_json_config_field",
-        "set_json_config_field",
-        "/usr/bin/osascript -l JavaScript",
-        "JSON.parse(text)",
-        "writeToFileAtomically(argv[0], true)",
-        "validate_json_config \"$new_config\"",
-        "authority-edge-history.json",
-        "write_rotation_phase quiesced",
-        "finalize_transport_handover_history",
-        "consistent_checkpoint_tuple",
-        "append_transport_handover",
-        "roll_forward_transport_rotation",
-        "phase\" == \"switched\" || \"$phase\" == \"activating",
-        "expected_key_id",
-        "historical_keys.0",
-        "handovers.0",
-        "bloom.authority-edge-application-history.1",
-        "atomic_copy_preserving_metadata",
-        "health_check_enrollment",
-        "prepare_transport_rotation",
-        "swap_transport_rotation_tree",
+    for removed in [
         "--triad-render-macos-identity-rotation",
+        "recover_interrupted",
+        "retained_restore",
+        "transaction_staging",
     ] {
-        assert!(
-            source.contains(required),
-            "macOS installer is missing config-rotation invariant {required}"
-        );
+        assert!(!source.contains(removed));
     }
-    assert!(!source.contains("read_enrollment_field \"$staged/broker.json\" build_digest"));
-    assert!(!source.contains("read_enrollment_field \"$staged/signer.json\" build_digest"));
-
-    let recovery = source
-        .split("recover_interrupted_rotation() {")
-        .nth(1)
-        .unwrap()
-        .split("\n}\n\nrequire_same_config_field()")
-        .next()
-        .unwrap();
-    assert!(recovery.contains("if $rotation_in_progress; then"));
-    assert!(recovery.ends_with("return 0"));
-
-    assert!(source.contains("if ! $restoring_retained; then"));
-    let w0 =
-        fs::read_to_string(workspace().join("packaging/triad/macos/w0/run-disposable.sh")).unwrap();
-    for required in [
-        "interrupted_identity_rotation_pid",
-        "kill -STOP \"$interrupted_identity_rotation_pid\"",
-        "new application keys have",
-        "staged_edge_digest",
-        "post-activation identity recovery rolled back instead of forward",
-    ] {
-        assert!(w0.contains(required));
-    }
-    let identity_rotation = w0
-        .find("\"$installer\" rotate-identities / \"$login_uid\" &")
-        .unwrap();
-    let stopped = identity_rotation
-        + w0[identity_rotation..]
-            .find("kill -STOP \"$interrupted_identity_rotation_pid\"")
-            .unwrap();
-    let new_key_health = stopped + w0[stopped..].find("--triad-health-check").unwrap();
-    let killed = new_key_health
-        + w0[new_key_health..]
-            .find("kill -9 \"$interrupted_identity_rotation_pid\"")
-            .unwrap();
-    let recovered = killed
-        + w0[killed..]
-            .find("\"$installer\" rotate-config / \"$login_uid\" broker")
-            .unwrap();
-    let roll_forward_assertion = recovered
-        + w0[recovered..]
-            .find("post-activation identity recovery rolled back instead of forward")
-            .unwrap();
-    assert!(
-        identity_rotation < stopped
-            && stopped < new_key_health
-            && new_key_health < killed
-            && killed < recovered
-            && recovered < roll_forward_assertion
-    );
-    assert_ordered(
-        &source,
-        &[
-            "cp \"$retained_record\" \"$enrollment_temporary\"",
-            "if ! $restoring_retained; then",
-            "publish_enrollment_active",
-            "require_matching_enrollment_state \"$retained_record\" \"$enrollment\" active",
-        ],
-    );
-    assert!(source.contains("source_normalized=\"$(plutil -convert xml1 -o - \"$temporary\")\""));
-    assert!(
-        source
-            .contains("expected_normalized=\"$(plutil -convert xml1 -o - \"$expected_record\")\"")
-    );
-    assert!(source.contains("[[ \"$source_normalized\" == \"$expected_normalized\" ]]"));
+    assert!(!source.contains("source "));
 }
 
 #[test]
-#[cfg(target_os = "macos")]
-fn macos_json_config_helpers_accept_the_null_bearing_signer_config() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let installer =
+fn macos_installer_is_self_contained_and_pipe_safe() {
+    let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
-    let helpers = installer
-        .split("extract_json_config_field() {")
-        .nth(1)
-        .and_then(|tail| {
-            tail.split("\nrequire_network_containment_config() {")
-                .next()
-        })
-        .map(|body| format!("extract_json_config_field() {{{body}"))
-        .expect("extract JSON config helper definitions");
-    let temp = tempfile::tempdir().unwrap();
-    let signer_config = temp.path().join("signer.json");
-    let signer_template =
-        fs::read_to_string(workspace().join("packaging/triad/macos/config/signer.json.in"))
-            .unwrap();
-    fs::write(&signer_config, signer_template.replace("@LOGIN_UID@", "42")).unwrap();
-    fs::set_permissions(&signer_config, fs::Permissions::from_mode(0o600)).unwrap();
-    let command = format!(
-        "set -e\n\
-         {helpers}\n\
-         extract_json_config_field \"$1\" audit_rotation_previous_key raw\n\
-         set_json_config_field \"$1\" network_containment \
-           '{{\"status_path\":\"/private/var/run/bloom/43/containment/status.json\",\"login_uid\":43,\"maximum_age_ms\":5000}}'\n\
-         extract_json_config_field \"$1\" network_containment.login_uid raw"
-    );
-    let output = Command::new("/bin/bash")
-        .args(["-c", &command, "--"])
-        .arg(&signer_config)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "JSON config helpers failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "null\n43\n");
-    assert_eq!(
-        fs::metadata(&signer_config).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    assert!(source.contains("curl ... | sudo bash -s --"));
+    assert!(!source.contains("BASH_SOURCE"));
+    assert!(!source.contains("ssh-ed25519-verify.sh"));
+    assert!(source.contains("ssh-keygen -Y verify"));
 }
 
 #[test]
-fn macos_permanent_uninstall_is_forward_recoverable() {
+fn macos_permanent_uninstall_is_explicit_and_small() {
     let source =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
     for required in [
-        "bloom.macos-uninstall-transaction.2",
-        "$uninstall_root/.new.$$",
-        "prepare_uninstall_transaction",
-        "execute_uninstall_transaction",
-        "recover_interrupted_uninstalls",
-        "state -string uninstalling",
-        "delete_directory_record_if_exact",
-        "custody state is not recoverable",
-        "retain-bloom-login-$login_uid",
-        "recover_retained_restores",
-        "must be restored with its exact signed release",
+        "delete-bloom-login-LOGIN_UID",
+        "uninstall confirmation mismatch",
+        "Bloom macOS enrollment permanently removed",
     ] {
         assert!(
             source.contains(required),
-            "macOS installer is missing uninstall invariant {required}"
+            "macOS installer is missing uninstall behavior {required}"
         );
     }
 }
@@ -587,8 +328,8 @@ fn activating_enrollment_is_private_to_installer_health_and_session_bootstrap() 
     assert!(sentinel.contains("Some(\"activating\" | \"active\")"));
     let installer =
         fs::read_to_string(workspace().join("packaging/triad/release/install-macos.sh")).unwrap();
-    let health = installer.find("health_check_enrollment").unwrap();
-    let publish = installer.rfind("publish_enrollment_active").unwrap();
+    let health = installer.find("start_and_check").unwrap();
+    let publish = installer.rfind("write_enrollment active").unwrap();
     assert!(health < publish);
 }
 
@@ -635,9 +376,10 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(source.contains("/private/var/db/bloom-w0-disposable-host"));
     assert!(source.contains("bloom-macos-unix-w0-disposable-v1"));
     assert!(source.contains("macos-unix-principals-w0"));
-    assert!(source.contains("FAILING_UPGRADE_PAYLOAD"));
-    assert!(source.contains("kill -9 \"$interrupted_pid\""));
-    assert!(source.contains("upgrade-transaction/phase"));
+    assert!(!source.contains("UPGRADE_PAYLOAD"));
+    assert!(!source.contains("upgrade-transaction"));
+    assert!(!source.contains("rotation-transaction"));
+    assert!(!source.contains("retain-bloom-login"));
     assert!(source.contains("/usr/bin/nc -lk 127.0.0.1 18734"));
     assert!(source.contains("no fallback port will be used"));
     assert!(source.contains("Broker opened a fallback TCP listener"));

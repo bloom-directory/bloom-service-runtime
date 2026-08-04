@@ -27,7 +27,7 @@ fn production_provenance_catalog_has_no_retired_native_hyperliquid_authority() {
 }
 
 #[test]
-fn machine_authority_boundary_baseline_is_ratcheted_and_strict_release_is_blocked() {
+fn machine_authority_boundary_is_directly_enforced_and_strict_release_is_blocked() {
     let release_dir = workspace().join("packaging/triad/release");
     let tested = Command::new(release_dir.join("test-machine-authority-boundary.sh"))
         .output()
@@ -98,6 +98,15 @@ fn make_staging(root: &Path) -> PathBuf {
 
 fn make_installer_payload(root: &Path) -> PathBuf {
     let payload = make_staging(root);
+    let macos = workspace().join("packaging/triad/macos");
+    for relative in ["launchagents", "launchdaemons", "pf"] {
+        let destination = payload.join("installer/macos").join(relative);
+        fs::create_dir_all(&destination).unwrap();
+        for entry in fs::read_dir(macos.join(relative)).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+        }
+    }
     fs::create_dir_all(payload.join("config")).unwrap();
     for config in [
         "edge-manifest.json",
@@ -1139,12 +1148,12 @@ fn macos_installer_stages_unix_principals_launchdaemons_and_confirmed_uninstall(
             & 0o777,
         0o644
     );
-    assert!(enrollment.contains("\"broker_gid\": 260499"));
-    assert!(enrollment.contains("\"state\": \"activating\""));
-    assert!(enrollment.contains("\"signer_gid\": 260500"));
-    assert!(enrollment.contains("\"machine_broker_gid\": 260501"));
-    assert!(enrollment.contains("\"broker_signer_gid\": 260502"));
-    assert!(enrollment.contains("\"revoke_gid\": 260503"));
+    assert!(enrollment.contains("\"broker_gid\":260499"));
+    assert!(enrollment.contains("\"state\":\"activating\""));
+    assert!(enrollment.contains("\"signer_gid\":260500"));
+    assert!(enrollment.contains("\"machine_broker_gid\":260501"));
+    assert!(enrollment.contains("\"broker_signer_gid\":260502"));
+    assert!(enrollment.contains("\"revoke_gid\":260503"));
     let pf = fs::read_to_string(root.join("etc/pf.anchors/com.bloom.triad.501")).unwrap();
     assert!(pf.contains("user 250501"));
     assert!(pf.contains("user 250502"));
@@ -1235,7 +1244,7 @@ fn macos_installer_never_repairs_or_overwrites_a_digest_named_release() {
     assert!(!rejected.status.success());
     assert!(
         String::from_utf8_lossy(&rejected.stderr)
-            .contains("existing versioned Bloom release does not match its digest")
+            .contains("digest-named release does not match the verified payload")
     );
     assert_eq!(fs::read(installed_broker).unwrap(), b"substituted");
 }
