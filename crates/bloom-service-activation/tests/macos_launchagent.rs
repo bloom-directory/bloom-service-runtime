@@ -453,7 +453,7 @@ fn privileged_w0_harness_requires_an_external_disposable_host_marker() {
     assert!(installed_acceptance.contains("BLOOM_ACCEPTANCE_BUNDLE_ROOT"));
     assert!(installed_acceptance.contains("assert_installed_process bloom-broker"));
     assert!(installed_acceptance.contains("assert_installed_process bloom-signer"));
-    assert!(installed_acceptance.contains("-p bloom-triad-protocol"));
+    assert!(installed_acceptance.contains("-p bloom-rpc-wire"));
     assert!(installed_acceptance.contains("--workspace"));
     assert!(
         !installed_acceptance.contains("touch \"$marker\"")

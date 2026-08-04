@@ -18,6 +18,40 @@ fn release_script(name: &str) -> PathBuf {
 }
 
 #[test]
+fn release_compatibility_declares_each_edge_without_a_global_protocol_range() {
+    fn is_legacy_global_protocol_key(line: &str) -> bool {
+        let line = line.trim_start();
+        ["protocol_major", "protocol_minor_min", "protocol_minor_max"]
+            .into_iter()
+            .any(|key| {
+                line.strip_prefix(key)
+                    .is_some_and(|tail| tail.trim_start().starts_with('='))
+            })
+    }
+
+    let release = workspace().join("packaging/triad/release");
+    let compatibility = fs::read_to_string(release.join("compatibility-v1.toml")).unwrap();
+    for exact_authority in ["machine_broker", "broker_signer"] {
+        let block =
+            format!("[protocols.{exact_authority}]\nmajor = 1\nminor_min = 1\nminor_max = 1");
+        assert!(compatibility.contains(&block));
+    }
+    for compatible_support in ["signer_control", "session"] {
+        let block =
+            format!("[protocols.{compatible_support}]\nmajor = 1\nminor_min = 0\nminor_max = 1");
+        assert!(compatibility.contains(&block));
+    }
+    assert!(!compatibility.lines().any(is_legacy_global_protocol_key));
+    assert!(is_legacy_global_protocol_key("  protocol_major = 1"));
+    assert!(is_legacy_global_protocol_key("\tprotocol_minor_min = 0"));
+
+    let verifier = fs::read_to_string(release.join("verify-bundle.sh")).unwrap();
+    assert!(verifier.contains("for authority_edge in machine_broker broker_signer"));
+    assert!(verifier.contains("for support_edge in signer_control session"));
+    assert!(verifier.contains("must not declare a global protocol range"));
+}
+
+#[test]
 fn production_provenance_catalog_has_no_retired_native_hyperliquid_authority() {
     let catalog = fs::read_to_string(
         workspace().join("packaging/triad/macos/config/provenance-catalog.unsigned.json"),
