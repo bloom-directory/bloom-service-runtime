@@ -18,7 +18,7 @@ use std::{
     },
 };
 
-use bloom_triad_protocol::{SignedJournalHead, Token};
+use bloom_rpc_wire::{SignedJournalHead, Token};
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -826,15 +826,15 @@ pub struct ApplicationKeyHandover {
     pub service_id: Token,
     pub old_key_id: Token,
     pub new_key_id: Token,
-    pub sequence: bloom_triad_protocol::DecimalU64,
-    pub head_hash: bloom_triad_protocol::Digest32,
+    pub sequence: bloom_rpc_wire::DecimalU64,
+    pub head_hash: bloom_rpc_wire::Digest32,
 }
 
 fn checkpoint_filename(head: &SignedJournalHead) -> String {
-    let service_name = bloom_triad_protocol::Digest32::from_bytes(
+    let service_name = bloom_rpc_wire::Digest32::from_bytes(
         Sha256::digest(head.service_id.as_str().as_bytes()).into(),
     );
-    let key_name = bloom_triad_protocol::Digest32::from_bytes(
+    let key_name = bloom_rpc_wire::Digest32::from_bytes(
         Sha256::digest(head.key_id.as_str().as_bytes()).into(),
     );
     format!(
@@ -900,7 +900,7 @@ fn record_stamp_from_metadata(metadata: &fs::Metadata) -> RecordStamp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloom_triad_protocol::{Base64UrlBytes, DecimalU64, Digest32};
+    use bloom_rpc_wire::{Base64UrlBytes, DecimalU64, Digest32};
     use ed25519_dalek::{Signer as _, SigningKey};
     use std::os::unix::fs::symlink;
 

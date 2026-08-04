@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bloom-rpc-wire.workspace = true
 libc.workspace = true
 thiserror.workspace = true
 

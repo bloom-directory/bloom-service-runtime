@@ -13,6 +13,20 @@ use std::os::{
 };
 use std::{fs, net::TcpListener, path::Path};
 
+use bloom_rpc_wire::{ProtocolVersion, ProtocolVersionRange};
+
+/// Current mechanical protocol version for the login-session sentinel edge.
+///
+/// This non-authority compatibility policy is independent of both the
+/// Machine↔Broker and Broker↔Signer authority API version ranges.
+pub const SESSION_PROTOCOL_CURRENT: ProtocolVersion = ProtocolVersion::new(1, 1);
+
+/// Accepted mechanical versions for the login-session sentinel edge.
+///
+/// Minor 1.0 remains intentionally compatible here because this edge carries
+/// authentication/liveness only and never carries authority journal heads.
+pub const SESSION_PROTOCOL_RANGE: ProtocolVersionRange = ProtocolVersionRange::new(1, 0, 1);
+
 #[derive(Debug, thiserror::Error)]
 pub enum ActivationError {
     #[error("service activation rejected: {0}")]
@@ -333,6 +347,29 @@ mod linux {
 mod tests {
     use super::*;
     use std::os::fd::OwnedFd;
+
+    #[test]
+    fn session_protocol_range_accepts_legacy_and_current_but_rejects_incompatible_versions() {
+        SESSION_PROTOCOL_RANGE
+            .require(ProtocolVersion::new(1, 0))
+            .unwrap();
+        SESSION_PROTOCOL_RANGE
+            .require(SESSION_PROTOCOL_CURRENT)
+            .unwrap();
+        for incompatible in [
+            ProtocolVersion::new(0, 1),
+            ProtocolVersion::new(1, 2),
+            ProtocolVersion::new(2, 0),
+        ] {
+            assert_eq!(
+                SESSION_PROTOCOL_RANGE
+                    .require(incompatible)
+                    .unwrap_err()
+                    .code,
+                bloom_rpc_wire::WireErrorCode::UnsupportedVersion
+            );
+        }
+    }
 
     #[test]
     fn two_named_listeners_are_selected_and_consumed_independently() {

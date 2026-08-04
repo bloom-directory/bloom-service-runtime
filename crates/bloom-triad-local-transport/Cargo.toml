@@ -9,7 +9,7 @@ license.workspace = true
 triad-dev-harness = []
 
 [dependencies]
-bloom-triad-protocol.workspace = true
+bloom-rpc-wire.workspace = true
 bloom-trusted-time.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
@@ -22,6 +22,5 @@ sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "net"] }
 
 [dev-dependencies]
-bloom-audit-checkpoint.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

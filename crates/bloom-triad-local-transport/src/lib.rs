@@ -5,24 +5,25 @@
 
 mod containment;
 
+pub use bloom_rpc_wire::{WireError as TransportError, WireErrorCode as TransportErrorCode};
 pub use containment::NetworkContainmentGuard;
 
 use std::{
     collections::VecDeque,
     fs,
+    future::Future,
     os::unix::fs::MetadataExt,
     path::Path,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use bloom_triad_protocol::{
-    AuthenticatedPeer, Base64UrlBytes, BootEpoch, BrokerSignerRequest, BrokerSignerResponse,
-    BrokerSignerService, ControlRequest, ControlResponse, DecimalU64, Digest32, EnvelopeKind,
-    HelloChallenge, MachineBrokerRequest, MachineBrokerResponse, MachineBrokerService, OperationId,
-    ProtocolError, ProtocolErrorCode, ProtocolVersion, RPC_ENVELOPE_SCHEMA_V1,
-    RevocationControlService, SignedEnvelope, SignedJournalHead, Token, TypedRequestMethod,
-    UnsignedEnvelope, decode_frame, encode_frame,
+use bloom_rpc_wire::{
+    AuthenticatedPeer, Base64UrlBytes, BootEpoch, DecimalU64, Digest32, EnvelopeKind,
+    HelloChallenge, JournalHeadPolicy, OperationId, ProtocolVersion, ProtocolVersionRange,
+    RPC_ENVELOPE_SCHEMA_V1, SignedEnvelope, SignedJournalHead, Token, TypedRequestMethod,
+    UnsignedEnvelope, WireError as ProtocolError, WireErrorCode as ProtocolErrorCode, decode_frame,
+    encode_frame,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::{RngCore, rngs::OsRng};
@@ -90,14 +91,14 @@ impl EndpointQuota {
 
     pub fn admit(
         &self,
-        method: &Token,
+        is_read_only: bool,
         observed_at_ms: u64,
     ) -> Result<EndpointAdmission, ProtocolError> {
         self.request_rate
             .lock()
             .map_err(|_| unavailable("request rate gate poisoned".into()))?
             .admit(observed_at_ms, "request rate quota exhausted")?;
-        if is_read_only_method(method) {
+        if is_read_only {
             return Ok(EndpointAdmission {
                 _mutation_permit: None,
             });
@@ -143,27 +144,6 @@ impl SlidingAdmission {
         self.accepted_at_ms.push_back(now_ms);
         Ok(())
     }
-}
-
-/// Return whether a closed triad method is observational and must remain
-/// available while an audit or peer-checkpoint failure has latched mutations
-/// off. Both halves of the Broker-Signer edge use this classification so a
-/// checkpoint failure cannot accidentally suppress status recovery.
-pub fn is_read_only_method(method: &Token) -> bool {
-    let method = method.as_str();
-    method.ends_with(".read")
-        || method.ends_with(".readiness")
-        || method.ends_with(".capabilities")
-        || method.ends_with(".status")
-        || method.ends_with(".list")
-        || method.ends_with(".list_public")
-        || method.ends_with(".get_public")
-        || method == "revocation.state"
-        || method == "sealed_approval.limit_state"
-        || method == "key.derivation_capabilities"
-        || method == "key.list_derived"
-        || method == "credential.list_public"
-        || method == "custody.result"
 }
 
 #[derive(Clone)]
@@ -440,20 +420,36 @@ pub async fn authenticate_client(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
     broker: &PeerAcl,
+    current_version: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
 ) -> Result<(), ProtocolError> {
+    supported_versions.require(current_version)?;
     require_peer_uid(stream, broker.effective_uid)?;
     let server_challenge: HelloChallenge = read_frame(stream).await?;
-    verify_hello(&server_challenge, broker)?;
+    verify_hello(&server_challenge, broker, supported_versions)?;
     write_frame(
         stream,
-        &signed_hello(identity, server_challenge.challenge.clone())?,
+        &signed_hello(
+            identity,
+            server_challenge.challenge.clone(),
+            server_challenge.protocol,
+        )?,
     )
     .await?;
 
     let client_challenge = random_digest();
-    write_frame(stream, &signed_hello(identity, client_challenge.clone())?).await?;
+    write_frame(
+        stream,
+        &signed_hello(identity, client_challenge.clone(), current_version)?,
+    )
+    .await?;
     let server_response: HelloChallenge = read_frame(stream).await?;
-    verify_hello(&server_response, broker)?;
+    verify_hello(&server_response, broker, supported_versions)?;
+    if server_response.protocol != current_version {
+        return Err(unsupported_version(
+            "server hello response did not echo the accepted version",
+        ));
+    }
     if server_response.challenge != client_challenge {
         return Err(unauthenticated(
             "Broker did not answer Machine's fresh challenge",
@@ -466,12 +462,24 @@ pub async fn authenticate_server(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
     client: &PeerAcl,
+    current_version: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
 ) -> Result<(), ProtocolError> {
+    supported_versions.require(current_version)?;
     require_peer_uid(stream, client.effective_uid)?;
     let server_challenge = random_digest();
-    write_frame(stream, &signed_hello(identity, server_challenge.clone())?).await?;
+    write_frame(
+        stream,
+        &signed_hello(identity, server_challenge.clone(), current_version)?,
+    )
+    .await?;
     let client_response: HelloChallenge = read_frame(stream).await?;
-    verify_hello(&client_response, client)?;
+    verify_hello(&client_response, client, supported_versions)?;
+    if client_response.protocol != current_version {
+        return Err(unsupported_version(
+            "client hello response did not echo the accepted version",
+        ));
+    }
     if client_response.challenge != server_challenge {
         return Err(unauthenticated(
             "client did not answer server's fresh challenge",
@@ -479,10 +487,14 @@ pub async fn authenticate_server(
     }
 
     let client_challenge: HelloChallenge = read_frame(stream).await?;
-    verify_hello(&client_challenge, client)?;
+    verify_hello(&client_challenge, client, supported_versions)?;
     write_frame(
         stream,
-        &signed_hello(identity, client_challenge.challenge.clone())?,
+        &signed_hello(
+            identity,
+            client_challenge.challenge.clone(),
+            client_challenge.protocol,
+        )?,
     )
     .await
 }
@@ -498,7 +510,10 @@ pub async fn authenticate_server_one_of(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
     clients: &[PeerAcl],
+    current_version: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
 ) -> Result<PeerAcl, ProtocolError> {
+    supported_versions.require(current_version)?;
     let observed_uid = peer_uid(stream)?;
     let candidates = clients
         .iter()
@@ -509,7 +524,11 @@ pub async fn authenticate_server_one_of(
     }
 
     let server_challenge = random_digest();
-    write_frame(stream, &signed_hello(identity, server_challenge.clone())?).await?;
+    write_frame(
+        stream,
+        &signed_hello(identity, server_challenge.clone(), current_version)?,
+    )
+    .await?;
     let client_response: HelloChallenge = read_frame(stream).await?;
     let client = candidates
         .into_iter()
@@ -519,7 +538,12 @@ pub async fn authenticate_server_one_of(
                 && candidate.application_key_id == client_response.application_key_id
         })
         .ok_or_else(|| unauthenticated("hello identity is not in the pinned peer set"))?;
-    verify_hello(&client_response, client)?;
+    verify_hello(&client_response, client, supported_versions)?;
+    if client_response.protocol != current_version {
+        return Err(unsupported_version(
+            "client hello response did not echo the accepted version",
+        ));
+    }
     if client_response.challenge != server_challenge {
         return Err(unauthenticated(
             "client did not answer server's fresh challenge",
@@ -527,18 +551,25 @@ pub async fn authenticate_server_one_of(
     }
 
     let client_challenge: HelloChallenge = read_frame(stream).await?;
-    verify_hello(&client_challenge, client)?;
+    verify_hello(&client_challenge, client, supported_versions)?;
     write_frame(
         stream,
-        &signed_hello(identity, client_challenge.challenge.clone())?,
+        &signed_hello(
+            identity,
+            client_challenge.challenge.clone(),
+            client_challenge.protocol,
+        )?,
     )
     .await?;
     Ok(client.clone())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn sign_request<T>(
     identity: &LocalIdentity,
     audience: Token,
+    protocol: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
     operation_id: OperationId,
     body: T,
     sent_at_ms: u64,
@@ -550,6 +581,8 @@ where
     sign_request_with_optional_journal_head(
         identity,
         audience,
+        protocol,
+        supported_versions,
         operation_id,
         body,
         sent_at_ms,
@@ -558,9 +591,12 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn sign_request_with_journal_head<T>(
     identity: &LocalIdentity,
     audience: Token,
+    protocol: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
     operation_id: OperationId,
     body: T,
     sent_at_ms: u64,
@@ -573,6 +609,8 @@ where
     sign_request_with_optional_journal_head(
         identity,
         audience,
+        protocol,
+        supported_versions,
         operation_id,
         body,
         sent_at_ms,
@@ -581,9 +619,12 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_request_with_optional_journal_head<T>(
     identity: &LocalIdentity,
     audience: Token,
+    protocol: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
     operation_id: OperationId,
     body: T,
     sent_at_ms: u64,
@@ -593,9 +634,10 @@ fn sign_request_with_optional_journal_head<T>(
 where
     T: Clone + Serialize + TypedRequestMethod,
 {
+    supported_versions.require(protocol)?;
     let request_digest = digest(&body)?;
     let unsigned = UnsignedEnvelope {
-        protocol: ProtocolVersion::CURRENT,
+        protocol,
         schema: Token::new(RPC_ENVELOPE_SCHEMA_V1)?,
         kind: EnvelopeKind::Request,
         method: body.method()?,
@@ -666,7 +708,7 @@ where
     U: Serialize,
 {
     let unsigned = UnsignedEnvelope {
-        protocol: ProtocolVersion::CURRENT,
+        protocol: request.unsigned.protocol,
         schema: Token::new(RPC_ENVELOPE_SCHEMA_V1)?,
         kind: EnvelopeKind::Response,
         method: request.unsigned.method.clone(),
@@ -711,75 +753,109 @@ pub fn sign_journal_head(
     head
 }
 
-pub async fn call<T, U>(
+pub async fn call<T, U, E>(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
     server: &PeerAcl,
+    current_version: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
     body: T,
     timeout_ms: u64,
-) -> Result<U, ProtocolError>
+) -> Result<U, E>
 where
     T: Clone + Serialize + TypedRequestMethod,
     U: Serialize + DeserializeOwned,
+    E: DeserializeOwned + From<ProtocolError> + Serialize,
 {
-    let (body, _) =
-        call_with_optional_journal_head(stream, identity, server, body, timeout_ms, None).await?;
-    body
-}
-
-pub async fn call_with_journal_head<T, U>(
-    stream: &mut UnixStream,
-    identity: &LocalIdentity,
-    server: &PeerAcl,
-    body: T,
-    timeout_ms: u64,
-    sender_journal_head: SignedJournalHead,
-    checkpoint_response_head: impl FnOnce(&SignedJournalHead) -> Result<(), ProtocolError>,
-) -> Result<U, ProtocolError>
-where
-    T: Clone + Serialize + TypedRequestMethod,
-    U: Serialize + DeserializeOwned,
-{
-    call_with_optional_journal_head(
+    let (body, _) = call_with_optional_journal_head::<T, U, E>(
         stream,
         identity,
         server,
+        current_version,
+        supported_versions,
         body,
         timeout_ms,
-        Some(sender_journal_head),
+        None,
+        JournalHeadPolicy::Forbidden,
     )
     .await
-    .and_then(|(body, response_head)| {
-        let response_head = response_head.ok_or_else(|| {
-            ProtocolError::new(
-                ProtocolErrorCode::UnauthenticatedPeer,
-                "authority-edge response omitted its authenticated journal head",
-            )
-        })?;
-        checkpoint_response_head(&response_head)?;
-        body
-    })
+    .map_err(E::from)?;
+    body
 }
 
-async fn call_with_optional_journal_head<T, U>(
+#[allow(clippy::too_many_arguments)]
+pub async fn call_with_journal_head<T, U, E>(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
     server: &PeerAcl,
+    current_version: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
     body: T,
     timeout_ms: u64,
-    sender_journal_head: Option<SignedJournalHead>,
-) -> Result<(Result<U, ProtocolError>, Option<SignedJournalHead>), ProtocolError>
+    sender_journal_head: SignedJournalHead,
+    checkpoint_response_head: impl FnOnce(&SignedJournalHead) -> Result<(), E>,
+) -> Result<U, E>
 where
     T: Clone + Serialize + TypedRequestMethod,
     U: Serialize + DeserializeOwned,
+    E: DeserializeOwned + From<ProtocolError> + Serialize,
 {
-    authenticate_client(stream, identity, server).await?;
+    let (body, response_head) = call_with_optional_journal_head::<T, U, E>(
+        stream,
+        identity,
+        server,
+        current_version,
+        supported_versions,
+        body,
+        timeout_ms,
+        Some(sender_journal_head),
+        JournalHeadPolicy::Required,
+    )
+    .await
+    .map_err(E::from)?;
+    let response_head = response_head.ok_or_else(|| {
+        E::from(ProtocolError::new(
+            ProtocolErrorCode::UnauthenticatedPeer,
+            "authority-edge response omitted its authenticated journal head",
+        ))
+    })?;
+    checkpoint_response_head(&response_head)?;
+    body
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_with_optional_journal_head<T, U, E>(
+    stream: &mut UnixStream,
+    identity: &LocalIdentity,
+    server: &PeerAcl,
+    current_version: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
+    body: T,
+    timeout_ms: u64,
+    sender_journal_head: Option<SignedJournalHead>,
+    journal_head_policy: JournalHeadPolicy,
+) -> Result<(Result<U, E>, Option<SignedJournalHead>), ProtocolError>
+where
+    T: Clone + Serialize + TypedRequestMethod,
+    U: Serialize + DeserializeOwned,
+    E: DeserializeOwned + Serialize,
+{
+    authenticate_client(
+        stream,
+        identity,
+        server,
+        current_version,
+        supported_versions,
+    )
+    .await?;
     let observed_uid = peer_uid(stream)?;
     let sent_at_ms = now_ms()?;
     let operation_id = body.operation_id()?.unwrap_or_else(random_operation_id);
     let request = sign_request_with_optional_journal_head(
         identity,
         server.service_id.clone(),
+        current_version,
+        supported_versions,
         operation_id,
         body,
         sent_at_ms,
@@ -788,11 +864,13 @@ where
     )?;
     write_frame(stream, &request).await?;
 
-    let response: SignedEnvelope<Result<U, ProtocolError>> = read_frame(stream).await?;
+    let response: SignedEnvelope<Result<U, E>> = read_frame(stream).await?;
     response.verify_response_to(
         observed_uid,
         &server.authenticated_for(identity.service_id.clone()),
         &request,
+        supported_versions,
+        journal_head_policy,
     )?;
     require_live_deadline(&response, now_ms()?)?;
     Ok((
@@ -805,44 +883,58 @@ pub async fn receive_request<T>(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
     client: &PeerAcl,
+    current_version: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
+    journal_head_policy: JournalHeadPolicy,
 ) -> Result<SignedEnvelope<T>, ProtocolError>
 where
     T: Serialize + DeserializeOwned + TypedRequestMethod,
 {
-    authenticate_server(stream, identity, client).await?;
+    authenticate_server(
+        stream,
+        identity,
+        client,
+        current_version,
+        supported_versions,
+    )
+    .await?;
     let observed_uid = peer_uid(stream)?;
     let request: SignedEnvelope<T> = read_frame(stream).await?;
     request.verify_typed(
         observed_uid,
         &client.authenticated_for(identity.service_id.clone()),
+        supported_versions,
+        journal_head_policy,
     )?;
     require_live_deadline(&request, now_ms()?)?;
     Ok(request)
 }
 
-pub async fn send_response<T, U>(
+pub async fn send_response<T, U, E>(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
     request: &SignedEnvelope<T>,
-    response: Result<U, ProtocolError>,
+    response: Result<U, E>,
 ) -> Result<(), ProtocolError>
 where
     T: Serialize,
     U: Serialize,
+    E: Serialize,
 {
     send_response_with_optional_journal_head(stream, identity, request, response, None).await
 }
 
-pub async fn send_response_with_journal_head<T, U>(
+pub async fn send_response_with_journal_head<T, U, E>(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
     request: &SignedEnvelope<T>,
-    response: Result<U, ProtocolError>,
+    response: Result<U, E>,
     sender_journal_head: SignedJournalHead,
 ) -> Result<(), ProtocolError>
 where
     T: Serialize,
     U: Serialize,
+    E: Serialize,
 {
     send_response_with_optional_journal_head(
         stream,
@@ -854,16 +946,17 @@ where
     .await
 }
 
-async fn send_response_with_optional_journal_head<T, U>(
+async fn send_response_with_optional_journal_head<T, U, E>(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
     request: &SignedEnvelope<T>,
-    response: Result<U, ProtocolError>,
+    response: Result<U, E>,
     sender_journal_head: Option<SignedJournalHead>,
 ) -> Result<(), ProtocolError>
 where
     T: Serialize,
     U: Serialize,
+    E: Serialize,
 {
     let sent_at_ms = now_ms()?;
     if sent_at_ms >= request.unsigned.deadline_ms.get() {
@@ -883,174 +976,129 @@ where
     write_frame(stream, &envelope).await
 }
 
-pub async fn dispatch_machine_broker_connection(
+/// Protocol-neutral checkpoint seam for an authenticated RPC edge.
+pub trait JournalExchange<E>: Send + Sync {
+    fn checkpoint_request_head(
+        &self,
+        method: &Token,
+        peer_head: &SignedJournalHead,
+    ) -> Result<(), E>;
+
+    fn local_journal_head(&self, method: &Token) -> Result<(u64, Digest32), E>;
+}
+
+pub async fn dispatch_connection<T, U, E, Dispatch, DispatchFuture>(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
-    machine: &PeerAcl,
+    client: &PeerAcl,
+    current_version: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
     quota: &EndpointQuota,
-    service: &dyn MachineBrokerService,
-) -> Result<(), ProtocolError> {
-    let request = receive_request::<MachineBrokerRequest>(stream, identity, machine).await?;
-    let admission = match quota.admit(&request.unsigned.method, now_ms()?) {
+    dispatch: Dispatch,
+) -> Result<(), E>
+where
+    T: Clone + DeserializeOwned + Serialize + TypedRequestMethod,
+    U: Serialize,
+    E: From<ProtocolError> + Serialize,
+    Dispatch: FnOnce(T) -> DispatchFuture,
+    DispatchFuture: Future<Output = Result<U, E>>,
+{
+    let request = receive_request::<T>(
+        stream,
+        identity,
+        client,
+        current_version,
+        supported_versions,
+        JournalHeadPolicy::Forbidden,
+    )
+    .await
+    .map_err(E::from)?;
+    let admission = match quota.admit(
+        request.unsigned.body.is_read_only(),
+        now_ms().map_err(E::from)?,
+    ) {
         Ok(admission) => admission,
         Err(error) => {
-            return send_response::<_, MachineBrokerResponse>(
-                stream,
-                identity,
-                &request,
-                Err(error),
-            )
-            .await;
+            return send_response::<_, U, E>(stream, identity, &request, Err(E::from(error)))
+                .await
+                .map_err(E::from);
         }
     };
-    let result = service.dispatch(request.unsigned.body.clone()).await;
+    let result = dispatch(request.unsigned.body.clone()).await;
     drop(admission);
-    send_response::<_, MachineBrokerResponse>(stream, identity, &request, result).await
+    send_response::<_, U, E>(stream, identity, &request, result)
+        .await
+        .map_err(E::from)
 }
 
-/// Runtime seam for the mandatory Broker-Signer peer checkpoint exchange.
-/// Implementations must persist an incoming mutation head before returning
-/// success and expose the latest fully verified local audit head for the
-/// authenticated response envelope. During local audit degradation this may
-/// be the last verified prefix, allowing read/status responses while the peer
-/// independently detects any rollback against its retained checkpoint.
-pub trait BrokerSignerJournalExchange: Send + Sync {
-    fn checkpoint_request_head(
-        &self,
-        method: &Token,
-        peer_head: &SignedJournalHead,
-    ) -> Result<(), ProtocolError>;
-
-    fn local_journal_head(&self, method: &Token) -> Result<(u64, Digest32), ProtocolError>;
-}
-
-/// Runtime seam for the mandatory Machine-Broker peer checkpoint exchange.
-/// The Broker persists the authenticated Machine head before dispatching a
-/// mutation and supplies its own last fully verified head on every response.
-pub trait MachineBrokerJournalExchange: Send + Sync {
-    fn checkpoint_request_head(
-        &self,
-        method: &Token,
-        peer_head: &SignedJournalHead,
-    ) -> Result<(), ProtocolError>;
-
-    fn local_journal_head(&self) -> Result<(u64, Digest32), ProtocolError>;
-}
-
-pub async fn dispatch_machine_broker_connection_with_journal_heads(
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_connection_with_journal_heads<T, U, E, Dispatch, DispatchFuture>(
     stream: &mut UnixStream,
     identity: &LocalIdentity,
-    machine: &PeerAcl,
+    client: &PeerAcl,
+    current_version: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
     quota: &EndpointQuota,
-    service: &dyn MachineBrokerService,
-    journals: &dyn MachineBrokerJournalExchange,
-) -> Result<(), ProtocolError> {
-    let request = receive_request::<MachineBrokerRequest>(stream, identity, machine).await?;
+    journals: &dyn JournalExchange<E>,
+    dispatch: Dispatch,
+) -> Result<(), E>
+where
+    T: Clone + DeserializeOwned + Serialize + TypedRequestMethod,
+    U: Serialize,
+    E: From<ProtocolError> + Serialize,
+    Dispatch: FnOnce(T) -> DispatchFuture,
+    DispatchFuture: Future<Output = Result<U, E>>,
+{
+    let request = receive_request::<T>(
+        stream,
+        identity,
+        client,
+        current_version,
+        supported_versions,
+        JournalHeadPolicy::Required,
+    )
+    .await
+    .map_err(E::from)?;
+    let method = &request.unsigned.method;
     let peer_head = request
         .unsigned
         .sender_journal_head
         .as_ref()
         .ok_or_else(|| {
-            ProtocolError::new(
+            E::from(ProtocolError::new(
                 ProtocolErrorCode::UnauthenticatedPeer,
-                "Machine-Broker request omitted its authenticated journal head",
-            )
+                "authority-edge request omitted its authenticated journal head",
+            ))
         })?;
-    if let Err(error) = journals.checkpoint_request_head(&request.unsigned.method, peer_head) {
-        let (sequence, head_hash) = journals.local_journal_head()?;
+    if let Err(error) = journals.checkpoint_request_head(method, peer_head) {
+        let (sequence, head_hash) = journals.local_journal_head(method)?;
         let head = sign_journal_head(identity, sequence, head_hash);
-        return send_response_with_journal_head::<_, MachineBrokerResponse>(
+        return send_response_with_journal_head::<_, U, E>(
             stream,
             identity,
             &request,
             Err(error),
             head,
         )
-        .await;
+        .await
+        .map_err(E::from);
     }
-    let admission = quota.admit(&request.unsigned.method, now_ms()?);
-    let result = match admission {
+    let result = match quota.admit(
+        request.unsigned.body.is_read_only(),
+        now_ms().map_err(E::from)?,
+    ) {
         Ok(admission) => {
-            let result = service.dispatch(request.unsigned.body.clone()).await;
+            let result = dispatch(request.unsigned.body.clone()).await;
             drop(admission);
             result
         }
-        Err(error) => Err(error),
+        Err(error) => Err(E::from(error)),
     };
-    let (sequence, head_hash) = journals.local_journal_head()?;
+    let (sequence, head_hash) = journals.local_journal_head(method)?;
     let head = sign_journal_head(identity, sequence, head_hash);
-    send_response_with_journal_head::<_, MachineBrokerResponse>(
-        stream, identity, &request, result, head,
-    )
-    .await
-}
-
-pub async fn dispatch_broker_signer_connection_with_journal_heads(
-    stream: &mut UnixStream,
-    identity: &LocalIdentity,
-    broker: &PeerAcl,
-    quota: &EndpointQuota,
-    service: &dyn BrokerSignerService,
-    journals: &dyn BrokerSignerJournalExchange,
-) -> Result<(), ProtocolError> {
-    let request = receive_request::<BrokerSignerRequest>(stream, identity, broker).await?;
-    let peer_head = request
-        .unsigned
-        .sender_journal_head
-        .as_ref()
-        .ok_or_else(|| {
-            ProtocolError::new(
-                ProtocolErrorCode::UnauthenticatedPeer,
-                "Broker-Signer request omitted its authenticated journal head",
-            )
-        })?;
-    if let Err(error) = journals.checkpoint_request_head(&request.unsigned.method, peer_head) {
-        let (sequence, head_hash) = journals.local_journal_head(&request.unsigned.method)?;
-        let head = sign_journal_head(identity, sequence, head_hash);
-        return send_response_with_journal_head::<_, BrokerSignerResponse>(
-            stream,
-            identity,
-            &request,
-            Err(error),
-            head,
-        )
-        .await;
-    }
-    let admission = quota.admit(&request.unsigned.method, now_ms()?);
-    let result = match admission {
-        Ok(admission) => {
-            let result = service.dispatch(request.unsigned.body.clone()).await;
-            drop(admission);
-            result
-        }
-        Err(error) => Err(error),
-    };
-    let (sequence, head_hash) = journals.local_journal_head(&request.unsigned.method)?;
-    let head = sign_journal_head(identity, sequence, head_hash);
-    send_response_with_journal_head::<_, BrokerSignerResponse>(
-        stream, identity, &request, result, head,
-    )
-    .await
-}
-
-pub async fn dispatch_control_connection(
-    stream: &mut UnixStream,
-    identity: &LocalIdentity,
-    revoke_client: &PeerAcl,
-    quota: &EndpointQuota,
-    service: &dyn RevocationControlService,
-) -> Result<(), ProtocolError> {
-    let request = receive_request::<ControlRequest>(stream, identity, revoke_client).await?;
-    let admission = match quota.admit(&request.unsigned.method, now_ms()?) {
-        Ok(admission) => admission,
-        Err(error) => {
-            return send_response::<_, ControlResponse>(stream, identity, &request, Err(error))
-                .await;
-        }
-    };
-    let result = service.dispatch(request.unsigned.body.clone()).await;
-    drop(admission);
-    send_response::<_, ControlResponse>(stream, identity, &request, result).await
+    send_response_with_journal_head::<_, U, E>(stream, identity, &request, result, head)
+        .await
+        .map_err(E::from)
 }
 
 pub async fn write_frame<T: Serialize>(
@@ -1090,11 +1138,12 @@ pub async fn read_frame<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<
 fn signed_hello(
     identity: &LocalIdentity,
     challenge: Digest32,
+    protocol: ProtocolVersion,
 ) -> Result<HelloChallenge, ProtocolError> {
     let mut hello = HelloChallenge {
         service_id: identity.service_id.clone(),
         boot_epoch: identity.boot_epoch.clone(),
-        protocol: ProtocolVersion::CURRENT,
+        protocol,
         challenge,
         application_key_id: identity.application_key_id.clone(),
         signature: Base64UrlBytes::from_bytes(&[]),
@@ -1104,8 +1153,12 @@ fn signed_hello(
     Ok(hello)
 }
 
-fn verify_hello(hello: &HelloChallenge, expected: &PeerAcl) -> Result<(), ProtocolError> {
-    hello.protocol.validate()?;
+fn verify_hello(
+    hello: &HelloChallenge,
+    expected: &PeerAcl,
+    supported_versions: ProtocolVersionRange,
+) -> Result<(), ProtocolError> {
+    supported_versions.require(hello.protocol)?;
     if hello.service_id != expected.service_id
         || hello.boot_epoch != expected.boot_epoch
         || hello.application_key_id != expected.application_key_id
@@ -1240,6 +1293,10 @@ fn unauthenticated(message: &str) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::UnauthenticatedPeer, message)
 }
 
+fn unsupported_version(message: &str) -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::UnsupportedVersion, message)
+}
+
 fn unavailable(message: String) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::ServiceUnavailable, message)
 }
@@ -1247,11 +1304,141 @@ fn unavailable(message: String) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloom_audit_checkpoint::{CheckpointSink as _, CheckpointStore, PinnedAuditKey};
     #[cfg(feature = "triad-dev-harness")]
     use std::fs::Permissions;
+    #[cfg(feature = "triad-dev-harness")]
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const TEST_CURRENT: ProtocolVersion = ProtocolVersion::new(1, 1);
+    const TEST_RANGE: ProtocolVersionRange = ProtocolVersionRange::new(1, 1, 1);
+
+    async fn authenticate_client(
+        stream: &mut UnixStream,
+        identity: &LocalIdentity,
+        server: &PeerAcl,
+    ) -> Result<(), ProtocolError> {
+        super::authenticate_client(stream, identity, server, TEST_CURRENT, TEST_RANGE).await
+    }
+
+    async fn authenticate_server(
+        stream: &mut UnixStream,
+        identity: &LocalIdentity,
+        client: &PeerAcl,
+    ) -> Result<(), ProtocolError> {
+        super::authenticate_server(stream, identity, client, TEST_CURRENT, TEST_RANGE).await
+    }
+
+    async fn authenticate_server_one_of(
+        stream: &mut UnixStream,
+        identity: &LocalIdentity,
+        clients: &[PeerAcl],
+    ) -> Result<PeerAcl, ProtocolError> {
+        super::authenticate_server_one_of(stream, identity, clients, TEST_CURRENT, TEST_RANGE).await
+    }
+
+    fn sign_request<T>(
+        identity: &LocalIdentity,
+        audience: Token,
+        operation_id: OperationId,
+        body: T,
+        sent_at_ms: u64,
+        deadline_ms: u64,
+    ) -> Result<SignedEnvelope<T>, ProtocolError>
+    where
+        T: Clone + Serialize + TypedRequestMethod,
+    {
+        super::sign_request(
+            identity,
+            audience,
+            TEST_CURRENT,
+            TEST_RANGE,
+            operation_id,
+            body,
+            sent_at_ms,
+            deadline_ms,
+        )
+    }
+
+    fn sign_request_with_journal_head<T>(
+        identity: &LocalIdentity,
+        audience: Token,
+        operation_id: OperationId,
+        body: T,
+        sent_at_ms: u64,
+        deadline_ms: u64,
+        sender_journal_head: SignedJournalHead,
+    ) -> Result<SignedEnvelope<T>, ProtocolError>
+    where
+        T: Clone + Serialize + TypedRequestMethod,
+    {
+        super::sign_request_with_journal_head(
+            identity,
+            audience,
+            TEST_CURRENT,
+            TEST_RANGE,
+            operation_id,
+            body,
+            sent_at_ms,
+            deadline_ms,
+            sender_journal_head,
+        )
+    }
+
+    async fn call_with_journal_head<T, U, E>(
+        stream: &mut UnixStream,
+        identity: &LocalIdentity,
+        server: &PeerAcl,
+        body: T,
+        timeout_ms: u64,
+        sender_journal_head: SignedJournalHead,
+        checkpoint_response_head: impl FnOnce(&SignedJournalHead) -> Result<(), E>,
+    ) -> Result<U, E>
+    where
+        T: Clone + Serialize + TypedRequestMethod,
+        U: Serialize + DeserializeOwned,
+        E: DeserializeOwned + From<ProtocolError> + Serialize,
+    {
+        super::call_with_journal_head(
+            stream,
+            identity,
+            server,
+            TEST_CURRENT,
+            TEST_RANGE,
+            body,
+            timeout_ms,
+            sender_journal_head,
+            checkpoint_response_head,
+        )
+        .await
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(tag = "method", content = "params", rename_all = "snake_case")]
+    enum FixtureRequest {
+        Mutate { operation_id: OperationId },
+        Read { value: Digest32 },
+    }
+
+    impl TypedRequestMethod for FixtureRequest {
+        fn operation_id(&self) -> Result<Option<OperationId>, ProtocolError> {
+            Ok(match self {
+                Self::Mutate { operation_id } => Some(operation_id.clone()),
+                Self::Read { .. } => None,
+            })
+        }
+
+        fn is_read_only(&self) -> bool {
+            matches!(self, Self::Read { .. })
+        }
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(tag = "result", content = "value", rename_all = "snake_case")]
+    enum FixtureResponse {
+        Mutated { operation_id: OperationId },
+        Read(Digest32),
+    }
 
     fn identity(name: &str, key_byte: u8) -> LocalIdentity {
         LocalIdentity {
@@ -1272,112 +1459,76 @@ mod tests {
         }
     }
 
-    struct CountingSignerService(AtomicUsize);
+    struct CountingService(AtomicUsize);
 
-    struct CountingMachineService(AtomicUsize);
-
-    struct IdempotentMachineMutationService {
+    struct IdempotentMutationService {
         durable_effects: AtomicUsize,
         completed: std::sync::Mutex<bool>,
     }
 
-    struct IdempotentSignerMutationService {
-        durable_effects: AtomicUsize,
-        completed: std::sync::Mutex<bool>,
+    trait FixtureService {
+        fn dispatch(
+            &self,
+            request: FixtureRequest,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<FixtureResponse, ProtocolError>> + '_>>;
     }
 
-    fn reconciled_approval_status() -> bloom_triad_protocol::ApprovalPublicStatus {
-        bloom_triad_protocol::ApprovalPublicStatus {
-            approval_id: Digest32::from_bytes([6; 32]),
-            wallet_id: Token::new("wallet-a").unwrap(),
-            state: bloom_triad_protocol::ApprovalLifecycleState::Revoked,
-            effective_claim_assurance: None,
-            ceremony_url: None,
-            ceremony_expires_at_ms: None,
-        }
-    }
-
-    impl MachineBrokerService for CountingMachineService {
-        fn dispatch<'a>(
-            &'a self,
-            _request: MachineBrokerRequest,
-        ) -> bloom_triad_protocol::ServiceFuture<'a, MachineBrokerResponse> {
+    impl FixtureService for CountingService {
+        fn dispatch(
+            &self,
+            _request: FixtureRequest,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<FixtureResponse, ProtocolError>> + '_>>
+        {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {
-                Ok(MachineBrokerResponse::ActionValidate(Digest32::from_bytes(
-                    [5; 32],
-                )))
-            })
+            Box::pin(async { Ok(FixtureResponse::Read(Digest32::from_bytes([5; 32]))) })
         }
     }
 
-    impl BrokerSignerService for CountingSignerService {
-        fn dispatch<'a>(
-            &'a self,
-            _request: BrokerSignerRequest,
-        ) -> bloom_triad_protocol::ServiceFuture<'a, BrokerSignerResponse> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {
-                Ok(BrokerSignerResponse::SignerReadiness(
-                    bloom_triad_protocol::Readiness {
-                        service_id: Token::new("bloom-signer").unwrap(),
-                        service_version: "test".into(),
-                        build_digest: Digest32::from_bytes([9; 32]),
-                        boot_epoch: BootEpoch::from_bytes([3; 16]),
-                        state: bloom_triad_protocol::ReadinessState::Ready,
-                        conditions: vec![],
-                    },
-                ))
-            })
-        }
-    }
-
-    impl MachineBrokerService for IdempotentMachineMutationService {
-        fn dispatch<'a>(
-            &'a self,
-            request: MachineBrokerRequest,
-        ) -> bloom_triad_protocol::ServiceFuture<'a, MachineBrokerResponse> {
-            match request {
-                MachineBrokerRequest::SealedApprovalRevoke(request) => {
-                    assert_eq!(request.operation_id, OperationId::from_bytes([6; 32]));
-                }
-                _ => panic!("unexpected Machine-Broker mutation"),
-            }
+    impl FixtureService for IdempotentMutationService {
+        fn dispatch(
+            &self,
+            request: FixtureRequest,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<FixtureResponse, ProtocolError>> + '_>>
+        {
+            let operation_id = match request {
+                FixtureRequest::Mutate { operation_id } => operation_id,
+                FixtureRequest::Read { .. } => panic!("unexpected read request"),
+            };
+            assert_eq!(operation_id, OperationId::from_bytes([6; 32]));
             let mut completed = self.completed.lock().unwrap();
             if !*completed {
                 self.durable_effects.fetch_add(1, Ordering::SeqCst);
                 *completed = true;
             }
-            Box::pin(async move {
-                Ok(MachineBrokerResponse::SealedApprovalRevoke(
-                    reconciled_approval_status(),
-                ))
-            })
+            Box::pin(async move { Ok(FixtureResponse::Mutated { operation_id }) })
         }
     }
 
-    impl BrokerSignerService for IdempotentSignerMutationService {
-        fn dispatch<'a>(
-            &'a self,
-            request: BrokerSignerRequest,
-        ) -> bloom_triad_protocol::ServiceFuture<'a, BrokerSignerResponse> {
-            match request {
-                BrokerSignerRequest::SealedApprovalRevoke(request) => {
-                    assert_eq!(request.operation_id, OperationId::from_bytes([6; 32]));
-                }
-                _ => panic!("unexpected Broker-Signer mutation"),
-            }
-            let mut completed = self.completed.lock().unwrap();
-            if !*completed {
-                self.durable_effects.fetch_add(1, Ordering::SeqCst);
-                *completed = true;
-            }
-            Box::pin(async {
-                Ok(BrokerSignerResponse::SealedApprovalRevoke(
-                    reconciled_approval_status(),
-                ))
-            })
-        }
+    async fn dispatch_fixture_connection_with_journal_heads(
+        stream: &mut UnixStream,
+        identity: &LocalIdentity,
+        client: &PeerAcl,
+        quota: &EndpointQuota,
+        service: &dyn FixtureService,
+        journals: &dyn JournalExchange<ProtocolError>,
+    ) -> Result<(), ProtocolError> {
+        dispatch_connection_with_journal_heads::<
+            FixtureRequest,
+            FixtureResponse,
+            ProtocolError,
+            _,
+            _,
+        >(
+            stream,
+            identity,
+            client,
+            TEST_CURRENT,
+            TEST_RANGE,
+            quota,
+            journals,
+            |request| service.dispatch(request),
+        )
+        .await
     }
 
     struct TestJournalExchange {
@@ -1385,28 +1536,7 @@ mod tests {
         fail_checkpoint: bool,
     }
 
-    struct StoreMachineJournalExchange {
-        checkpoints: CheckpointStore,
-    }
-
-    impl MachineBrokerJournalExchange for StoreMachineJournalExchange {
-        fn checkpoint_request_head(
-            &self,
-            _method: &Token,
-            peer_head: &SignedJournalHead,
-        ) -> Result<(), ProtocolError> {
-            self.checkpoints
-                .append_peer_head(peer_head)
-                .map(|_| ())
-                .map_err(|error| unavailable(format!("persist Machine checkpoint: {error}")))
-        }
-
-        fn local_journal_head(&self) -> Result<(u64, Digest32), ProtocolError> {
-            Ok((9, Digest32::from_bytes([9; 32])))
-        }
-    }
-
-    impl BrokerSignerJournalExchange for TestJournalExchange {
+    impl JournalExchange<ProtocolError> for TestJournalExchange {
         fn checkpoint_request_head(
             &self,
             _method: &Token,
@@ -1424,26 +1554,8 @@ mod tests {
         }
 
         fn local_journal_head(&self, _method: &Token) -> Result<(u64, Digest32), ProtocolError> {
-            Ok((7, Digest32::from_bytes([7; 32])))
-        }
-    }
-
-    impl MachineBrokerJournalExchange for TestJournalExchange {
-        fn checkpoint_request_head(
-            &self,
-            _method: &Token,
-            _peer_head: &SignedJournalHead,
-        ) -> Result<(), ProtocolError> {
-            self.checkpoints.fetch_add(1, Ordering::SeqCst);
-            if self.fail_checkpoint {
-                Err(unavailable("forced Machine checkpoint failure".into()))
-            } else {
-                Ok(())
-            }
-        }
-
-        fn local_journal_head(&self) -> Result<(u64, Digest32), ProtocolError> {
-            Ok((9, Digest32::from_bytes([9; 32])))
+            let value = 7;
+            Ok((value, Digest32::from_bytes([value as u8; 32])))
         }
     }
 
@@ -1608,6 +1720,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlapping_previous_and_current_minors_interoperate_and_response_echoes_request() {
+        const RANGE: ProtocolVersionRange = ProtocolVersionRange::new(7, 2, 3);
+        const CLIENT_VERSION: ProtocolVersion = ProtocolVersion::new(7, 2);
+        const SERVER_VERSION: ProtocolVersion = ProtocolVersion::new(7, 3);
+
+        let (mut client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let uid = client_stream.peer_cred().unwrap().uid();
+        let client_identity = identity("version-client", 10);
+        let server_identity = identity("version-server", 11);
+        let client_acl = acl(&client_identity, uid);
+        let server_acl = acl(&server_identity, uid);
+        let expected = Digest32::from_bytes([0x71; 32]);
+
+        let (client_result, server_result) = tokio::join!(
+            super::call::<_, FixtureResponse, ProtocolError>(
+                &mut client_stream,
+                &client_identity,
+                &server_acl,
+                CLIENT_VERSION,
+                RANGE,
+                FixtureRequest::Read {
+                    value: expected.clone(),
+                },
+                5_000,
+            ),
+            async {
+                let request = super::receive_request::<FixtureRequest>(
+                    &mut server_stream,
+                    &server_identity,
+                    &client_acl,
+                    SERVER_VERSION,
+                    RANGE,
+                    JournalHeadPolicy::Forbidden,
+                )
+                .await?;
+                assert_eq!(request.unsigned.protocol, CLIENT_VERSION);
+                super::send_response(
+                    &mut server_stream,
+                    &server_identity,
+                    &request,
+                    Ok::<_, ProtocolError>(FixtureResponse::Read(expected)),
+                )
+                .await
+            }
+        );
+        server_result.unwrap();
+        assert!(matches!(client_result.unwrap(), FixtureResponse::Read(_)));
+    }
+
+    #[tokio::test]
+    async fn incompatible_minor_fails_during_hello_before_dispatch() {
+        const CLIENT_VERSION: ProtocolVersion = ProtocolVersion::new(7, 1);
+        const CLIENT_RANGE: ProtocolVersionRange = ProtocolVersionRange::new(7, 1, 3);
+        const SERVER_VERSION: ProtocolVersion = ProtocolVersion::new(7, 3);
+        const SERVER_RANGE: ProtocolVersionRange = ProtocolVersionRange::new(7, 2, 3);
+
+        let (mut client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let uid = client_stream.peer_cred().unwrap().uid();
+        let client_identity = identity("version-client", 10);
+        let server_identity = identity("version-server", 11);
+        let client_acl = acl(&client_identity, uid);
+        let server_acl = acl(&server_identity, uid);
+        let service = CountingService(AtomicUsize::new(0));
+        let quota = EndpointQuota::new(1, 10, 1_000, 10, 1_000).unwrap();
+
+        let (client_result, server_result) = tokio::join!(
+            async {
+                let result = super::call::<_, FixtureResponse, ProtocolError>(
+                    &mut client_stream,
+                    &client_identity,
+                    &server_acl,
+                    CLIENT_VERSION,
+                    CLIENT_RANGE,
+                    FixtureRequest::Read {
+                        value: Digest32::from_bytes([0x72; 32]),
+                    },
+                    5_000,
+                )
+                .await;
+                drop(client_stream);
+                result
+            },
+            async {
+                let result = super::dispatch_connection::<
+                    FixtureRequest,
+                    FixtureResponse,
+                    ProtocolError,
+                    _,
+                    _,
+                >(
+                    &mut server_stream,
+                    &server_identity,
+                    &client_acl,
+                    SERVER_VERSION,
+                    SERVER_RANGE,
+                    &quota,
+                    |request| service.dispatch(request),
+                )
+                .await;
+                drop(server_stream);
+                result
+            }
+        );
+        assert_eq!(
+            client_result.unwrap_err().code,
+            ProtocolErrorCode::ServiceUnavailable
+        );
+        assert_eq!(
+            server_result.unwrap_err().code,
+            ProtocolErrorCode::UnsupportedVersion
+        );
+        assert_eq!(service.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn peer_checkpoint_failure_prevents_mutation_dispatch_and_returns_signed_head() {
         let (mut broker_stream, mut signer_stream) = UnixStream::pair().unwrap();
         let uid = broker_stream.peer_cred().unwrap().uid();
@@ -1615,19 +1842,19 @@ mod tests {
         let signer = identity("bloom-signer", 3);
         let broker_acl = acl(&broker, uid);
         let signer_acl = acl(&signer, uid);
-        let service = CountingSignerService(AtomicUsize::new(0));
+        let service = CountingService(AtomicUsize::new(0));
         let journals = TestJournalExchange {
             checkpoints: AtomicUsize::new(0),
             fail_checkpoint: true,
         };
         let quota = EndpointQuota::new(2, 10, 1_000, 10, 1_000).unwrap();
-        let request = BrokerSignerRequest::CeremonyCancel(bloom_triad_protocol::IdRequest {
-            id: Digest32::from_bytes([5; 32]),
-        });
+        let request = FixtureRequest::Mutate {
+            operation_id: OperationId::from_bytes([5; 32]),
+        };
         let broker_head = sign_journal_head(&broker, 4, Digest32::from_bytes([4; 32]));
         let response_checkpoints = AtomicUsize::new(0);
         let (client, server) = tokio::join!(
-            call_with_journal_head::<_, BrokerSignerResponse>(
+            call_with_journal_head::<_, FixtureResponse, ProtocolError>(
                 &mut broker_stream,
                 &broker,
                 &signer_acl,
@@ -1639,7 +1866,7 @@ mod tests {
                     Ok(())
                 },
             ),
-            dispatch_broker_signer_connection_with_journal_heads(
+            dispatch_fixture_connection_with_journal_heads(
                 &mut signer_stream,
                 &signer,
                 &broker_acl,
@@ -1666,17 +1893,19 @@ mod tests {
         let broker = identity("bloom-broker", 2);
         let machine_acl = acl(&machine, uid);
         let broker_acl = acl(&broker, uid);
-        let service = CountingMachineService(AtomicUsize::new(0));
+        let service = CountingService(AtomicUsize::new(0));
         let journals = TestJournalExchange {
             checkpoints: AtomicUsize::new(0),
             fail_checkpoint: true,
         };
         let quota = EndpointQuota::new(2, 10, 1_000, 10, 1_000).unwrap();
-        let request = MachineBrokerRequest::ActionValidate(Digest32::from_bytes([5; 32]));
+        let request = FixtureRequest::Read {
+            value: Digest32::from_bytes([5; 32]),
+        };
         let machine_head = sign_journal_head(&machine, 4, Digest32::from_bytes([4; 32]));
         let response_checkpoints = AtomicUsize::new(0);
         let (client, server) = tokio::join!(
-            call_with_journal_head::<_, MachineBrokerResponse>(
+            call_with_journal_head::<_, FixtureResponse, ProtocolError>(
                 &mut machine_stream,
                 &machine,
                 &broker_acl,
@@ -1688,7 +1917,7 @@ mod tests {
                     Ok(())
                 },
             ),
-            dispatch_machine_broker_connection_with_journal_heads(
+            dispatch_fixture_connection_with_journal_heads(
                 &mut broker_stream,
                 &broker,
                 &machine_acl,
@@ -1709,27 +1938,16 @@ mod tests {
 
     #[tokio::test]
     async fn unchanged_machine_heads_do_not_starve_authenticated_broker_rpc() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let uid = fs::metadata(directory.path()).unwrap().uid();
         let machine = identity("bloom-machine", 1);
         let broker = identity("bloom-broker", 2);
+        let uid = rustix::process::geteuid().as_raw();
         let machine_acl = acl(&machine, uid);
         let broker_acl = acl(&broker, uid);
-        let journals = StoreMachineJournalExchange {
-            checkpoints: CheckpointStore::open(
-                directory.path(),
-                uid,
-                broker.service_id.clone(),
-                [PinnedAuditKey {
-                    service_id: machine.service_id.clone(),
-                    key_id: machine.application_key_id.clone(),
-                    verifying_key: machine.signing_key.verifying_key(),
-                }],
-            )
-            .unwrap(),
+        let journals = TestJournalExchange {
+            checkpoints: AtomicUsize::new(0),
+            fail_checkpoint: false,
         };
-        let service = CountingMachineService(AtomicUsize::new(0));
+        let service = CountingService(AtomicUsize::new(0));
         let quota = EndpointQuota::new(4, 256, 60_000, 256, 60_000).unwrap();
         let machine_head = sign_journal_head(&machine, 4, Digest32::from_bytes([4; 32]));
 
@@ -1737,16 +1955,18 @@ mod tests {
             for _ in 0..128 {
                 let (mut machine_stream, mut broker_stream) = UnixStream::pair().unwrap();
                 let (client, server) = tokio::join!(
-                    call_with_journal_head::<_, MachineBrokerResponse>(
+                    call_with_journal_head::<_, FixtureResponse, ProtocolError>(
                         &mut machine_stream,
                         &machine,
                         &broker_acl,
-                        MachineBrokerRequest::ActionValidate(Digest32::from_bytes([5; 32])),
+                        FixtureRequest::Read {
+                            value: Digest32::from_bytes([5; 32]),
+                        },
                         5_000,
                         machine_head.clone(),
                         |_| Ok(()),
                     ),
-                    dispatch_machine_broker_connection_with_journal_heads(
+                    dispatch_fixture_connection_with_journal_heads(
                         &mut broker_stream,
                         &broker,
                         &machine_acl,
@@ -1756,10 +1976,7 @@ mod tests {
                     )
                 );
                 server.unwrap();
-                assert!(matches!(
-                    client.unwrap(),
-                    MachineBrokerResponse::ActionValidate(_)
-                ));
+                assert!(matches!(client.unwrap(), FixtureResponse::Read(_)));
             }
         })
         .await
@@ -1775,7 +1992,7 @@ mod tests {
         let signer = identity("bloom-signer", 3);
         let broker_acl = acl(&broker, uid);
         let signer_acl = acl(&signer, uid);
-        let service = CountingSignerService(AtomicUsize::new(0));
+        let service = CountingService(AtomicUsize::new(0));
         let journals = TestJournalExchange {
             checkpoints: AtomicUsize::new(0),
             fail_checkpoint: false,
@@ -1783,11 +2000,13 @@ mod tests {
         let quota = EndpointQuota::new(2, 10, 1_000, 10, 1_000).unwrap();
         let broker_head = sign_journal_head(&broker, 4, Digest32::from_bytes([4; 32]));
         let (client, server) = tokio::join!(
-            call_with_journal_head::<_, BrokerSignerResponse>(
+            call_with_journal_head::<_, FixtureResponse, ProtocolError>(
                 &mut broker_stream,
                 &broker,
                 &signer_acl,
-                BrokerSignerRequest::SignerReadiness(bloom_triad_protocol::Empty {}),
+                FixtureRequest::Read {
+                    value: Digest32::from_bytes([5; 32]),
+                },
                 5_000,
                 broker_head,
                 |_| Err(ProtocolError::new(
@@ -1795,7 +2014,7 @@ mod tests {
                     "forced response checkpoint failure",
                 )),
             ),
-            dispatch_broker_signer_connection_with_journal_heads(
+            dispatch_fixture_connection_with_journal_heads(
                 &mut signer_stream,
                 &signer,
                 &broker_acl,
@@ -1817,7 +2036,7 @@ mod tests {
     async fn machine_broker_mutation_reconciles_after_response_checkpoint_failure() {
         let machine = identity("bloom-machine", 1);
         let broker = identity("bloom-broker", 2);
-        let service = IdempotentMachineMutationService {
+        let service = IdempotentMutationService {
             durable_effects: AtomicUsize::new(0),
             completed: std::sync::Mutex::new(false),
         };
@@ -1826,13 +2045,9 @@ mod tests {
             fail_checkpoint: false,
         };
         let quota = EndpointQuota::new(2, 10, 1_000, 10, 1_000).unwrap();
-        let request =
-            MachineBrokerRequest::SealedApprovalRevoke(bloom_triad_protocol::RevokeRequest {
-                operation_id: OperationId::from_bytes([6; 32]),
-                approval_id: Digest32::from_bytes([6; 32]),
-                wallet_id: Token::new("wallet-a").unwrap(),
-                reason: "test reconciliation".into(),
-            });
+        let request = FixtureRequest::Mutate {
+            operation_id: OperationId::from_bytes([6; 32]),
+        };
         let request_head = sign_journal_head(&machine, 4, Digest32::from_bytes([4; 32]));
 
         let (mut machine_stream, mut broker_stream) = UnixStream::pair().unwrap();
@@ -1840,7 +2055,7 @@ mod tests {
         let machine_acl = acl(&machine, uid);
         let broker_acl = acl(&broker, uid);
         let (client, server) = tokio::join!(
-            call_with_journal_head::<_, MachineBrokerResponse>(
+            call_with_journal_head::<_, FixtureResponse, ProtocolError>(
                 &mut machine_stream,
                 &machine,
                 &broker_acl,
@@ -1852,7 +2067,7 @@ mod tests {
                     "forced Machine response checkpoint failure",
                 )),
             ),
-            dispatch_machine_broker_connection_with_journal_heads(
+            dispatch_fixture_connection_with_journal_heads(
                 &mut broker_stream,
                 &broker,
                 &machine_acl,
@@ -1870,7 +2085,7 @@ mod tests {
 
         let (mut machine_stream, mut broker_stream) = UnixStream::pair().unwrap();
         let (client, server) = tokio::join!(
-            call_with_journal_head::<_, MachineBrokerResponse>(
+            call_with_journal_head::<_, FixtureResponse, ProtocolError>(
                 &mut machine_stream,
                 &machine,
                 &broker_acl,
@@ -1879,7 +2094,7 @@ mod tests {
                 request_head,
                 |_| Ok(()),
             ),
-            dispatch_machine_broker_connection_with_journal_heads(
+            dispatch_fixture_connection_with_journal_heads(
                 &mut broker_stream,
                 &broker,
                 &machine_acl,
@@ -1891,7 +2106,9 @@ mod tests {
         server.unwrap();
         assert_eq!(
             client.unwrap(),
-            MachineBrokerResponse::SealedApprovalRevoke(reconciled_approval_status())
+            FixtureResponse::Mutated {
+                operation_id: OperationId::from_bytes([6; 32])
+            }
         );
         assert_eq!(service.durable_effects.load(Ordering::SeqCst), 1);
         assert_eq!(journals.checkpoints.load(Ordering::SeqCst), 2);
@@ -1901,7 +2118,7 @@ mod tests {
     async fn broker_signer_mutation_reconciles_after_response_checkpoint_failure() {
         let broker = identity("bloom-broker", 2);
         let signer = identity("bloom-signer", 3);
-        let service = IdempotentSignerMutationService {
+        let service = IdempotentMutationService {
             durable_effects: AtomicUsize::new(0),
             completed: std::sync::Mutex::new(false),
         };
@@ -1910,13 +2127,9 @@ mod tests {
             fail_checkpoint: false,
         };
         let quota = EndpointQuota::new(2, 10, 1_000, 10, 1_000).unwrap();
-        let request =
-            BrokerSignerRequest::SealedApprovalRevoke(bloom_triad_protocol::RevokeRequest {
-                operation_id: OperationId::from_bytes([6; 32]),
-                approval_id: Digest32::from_bytes([6; 32]),
-                wallet_id: Token::new("wallet-a").unwrap(),
-                reason: "test reconciliation".into(),
-            });
+        let request = FixtureRequest::Mutate {
+            operation_id: OperationId::from_bytes([6; 32]),
+        };
         let request_head = sign_journal_head(&broker, 4, Digest32::from_bytes([4; 32]));
 
         let (mut broker_stream, mut signer_stream) = UnixStream::pair().unwrap();
@@ -1924,7 +2137,7 @@ mod tests {
         let broker_acl = acl(&broker, uid);
         let signer_acl = acl(&signer, uid);
         let (client, server) = tokio::join!(
-            call_with_journal_head::<_, BrokerSignerResponse>(
+            call_with_journal_head::<_, FixtureResponse, ProtocolError>(
                 &mut broker_stream,
                 &broker,
                 &signer_acl,
@@ -1936,7 +2149,7 @@ mod tests {
                     "forced Signer response checkpoint failure",
                 )),
             ),
-            dispatch_broker_signer_connection_with_journal_heads(
+            dispatch_fixture_connection_with_journal_heads(
                 &mut signer_stream,
                 &signer,
                 &broker_acl,
@@ -1954,7 +2167,7 @@ mod tests {
 
         let (mut broker_stream, mut signer_stream) = UnixStream::pair().unwrap();
         let (client, server) = tokio::join!(
-            call_with_journal_head::<_, BrokerSignerResponse>(
+            call_with_journal_head::<_, FixtureResponse, ProtocolError>(
                 &mut broker_stream,
                 &broker,
                 &signer_acl,
@@ -1963,7 +2176,7 @@ mod tests {
                 request_head,
                 |_| Ok(()),
             ),
-            dispatch_broker_signer_connection_with_journal_heads(
+            dispatch_fixture_connection_with_journal_heads(
                 &mut signer_stream,
                 &signer,
                 &broker_acl,
@@ -1975,7 +2188,9 @@ mod tests {
         server.unwrap();
         assert_eq!(
             client.unwrap(),
-            BrokerSignerResponse::SealedApprovalRevoke(reconciled_approval_status())
+            FixtureResponse::Mutated {
+                operation_id: OperationId::from_bytes([6; 32])
+            }
         );
         assert_eq!(service.durable_effects.load(Ordering::SeqCst), 1);
         assert_eq!(journals.checkpoints.load(Ordering::SeqCst), 2);
@@ -2113,9 +2328,9 @@ mod tests {
             &machine,
             broker.service_id.clone(),
             OperationId::from_bytes([4; 32]),
-            bloom_triad_protocol::MachineBrokerRequest::ActionValidate(Digest32::from_bytes(
-                [5; 32],
-            )),
+            FixtureRequest::Read {
+                value: Digest32::from_bytes([5; 32]),
+            },
             1,
             2,
         )
@@ -2124,9 +2339,7 @@ mod tests {
             &mut server,
             &broker,
             &request,
-            Ok::<_, ProtocolError>(bloom_triad_protocol::MachineBrokerResponse::ActionValidate(
-                Digest32::from_bytes([5; 32]),
-            )),
+            Ok::<_, ProtocolError>(FixtureResponse::Read(Digest32::from_bytes([5; 32]))),
         )
         .await
         .unwrap_err();
@@ -2145,7 +2358,9 @@ mod tests {
             &broker,
             signer.service_id.clone(),
             OperationId::from_bytes([5; 32]),
-            BrokerSignerRequest::SignerReadiness(bloom_triad_protocol::Empty {}),
+            FixtureRequest::Read {
+                value: Digest32::from_bytes([5; 32]),
+            },
             10,
             20,
             broker_head.clone(),
@@ -2155,6 +2370,8 @@ mod tests {
             .verify_typed(
                 501,
                 &broker_acl.authenticated_for(signer.service_id.clone()),
+                TEST_RANGE,
+                JournalHeadPolicy::Required,
             )
             .unwrap();
         assert_eq!(request.unsigned.sender_journal_head, Some(broker_head));
@@ -2163,7 +2380,9 @@ mod tests {
             &broker,
             signer.service_id.clone(),
             OperationId::from_bytes([6; 32]),
-            BrokerSignerRequest::SignerReadiness(bloom_triad_protocol::Empty {}),
+            FixtureRequest::Read {
+                value: Digest32::from_bytes([6; 32]),
+            },
             10,
             20,
         )
@@ -2172,7 +2391,9 @@ mod tests {
             missing
                 .verify_typed(
                     501,
-                    &broker_acl.authenticated_for(signer.service_id.clone())
+                    &broker_acl.authenticated_for(signer.service_id.clone()),
+                    TEST_RANGE,
+                    JournalHeadPolicy::Required,
                 )
                 .unwrap_err()
                 .code,
@@ -2183,16 +2404,7 @@ mod tests {
         let response = sign_response_with_journal_head(
             &signer,
             &request,
-            Ok::<_, ProtocolError>(BrokerSignerResponse::SignerReadiness(
-                bloom_triad_protocol::Readiness {
-                    service_id: signer.service_id.clone(),
-                    service_version: "test".into(),
-                    build_digest: Digest32::from_bytes([9; 32]),
-                    boot_epoch: signer.boot_epoch.clone(),
-                    state: bloom_triad_protocol::ReadinessState::Ready,
-                    conditions: vec![],
-                },
-            )),
+            Ok::<_, ProtocolError>(FixtureResponse::Read(Digest32::from_bytes([9; 32]))),
             11,
             20,
             signer_head.clone(),
@@ -2203,6 +2415,8 @@ mod tests {
                 502,
                 &signer_acl.authenticated_for(broker.service_id.clone()),
                 &request,
+                TEST_RANGE,
+                JournalHeadPolicy::Required,
             )
             .unwrap();
         assert_eq!(response.unsigned.sender_journal_head, Some(signer_head));
@@ -2217,7 +2431,9 @@ mod tests {
             &machine,
             broker.service_id.clone(),
             OperationId::from_bytes([7; 32]),
-            MachineBrokerRequest::ActionValidate(Digest32::from_bytes([7; 32])),
+            FixtureRequest::Read {
+                value: Digest32::from_bytes([7; 32]),
+            },
             10,
             20,
             sign_journal_head(&machine, 1, Digest32::from_bytes([1; 32])),
@@ -2227,6 +2443,8 @@ mod tests {
             .verify_typed(
                 501,
                 &machine_acl.authenticated_for(broker.service_id.clone()),
+                TEST_RANGE,
+                JournalHeadPolicy::Required,
             )
             .unwrap();
 
@@ -2234,7 +2452,9 @@ mod tests {
             &machine,
             broker.service_id.clone(),
             OperationId::from_bytes([8; 32]),
-            MachineBrokerRequest::ActionValidate(Digest32::from_bytes([8; 32])),
+            FixtureRequest::Read {
+                value: Digest32::from_bytes([8; 32]),
+            },
             10,
             20,
         )
@@ -2243,7 +2463,9 @@ mod tests {
             missing
                 .verify_typed(
                     501,
-                    &machine_acl.authenticated_for(broker.service_id.clone())
+                    &machine_acl.authenticated_for(broker.service_id.clone()),
+                    TEST_RANGE,
+                    JournalHeadPolicy::Required,
                 )
                 .unwrap_err()
                 .code,
@@ -2254,52 +2476,31 @@ mod tests {
     #[test]
     fn read_status_remains_available_while_mutation_quota_is_exhausted() {
         let quota = EndpointQuota::new(1, 10, 1_000, 10, 1_000).unwrap();
-        let mutation = quota
-            .admit(&Token::new("signer.sign").unwrap(), 100)
-            .unwrap();
+        let mutation = quota.admit(false, 100).unwrap();
         assert_eq!(
-            quota
-                .admit(&Token::new("signer.sign").unwrap(), 101)
-                .unwrap_err()
-                .code,
+            quota.admit(false, 101).unwrap_err().code,
             ProtocolErrorCode::QuotaExceeded
         );
-        quota
-            .admit(&Token::new("operation.status").unwrap(), 102)
-            .unwrap();
+        quota.admit(true, 102).unwrap();
         drop(mutation);
-        quota
-            .admit(&Token::new("signer.sign").unwrap(), 103)
-            .unwrap();
+        quota.admit(false, 103).unwrap();
     }
 
     #[test]
     fn endpoint_request_and_journal_windows_fail_closed_independently() {
         let request_limited = EndpointQuota::new(2, 1, 100, 10, 100).unwrap();
-        request_limited
-            .admit(&Token::new("operation.status").unwrap(), 10)
-            .unwrap();
+        request_limited.admit(true, 10).unwrap();
         assert_eq!(
-            request_limited
-                .admit(&Token::new("operation.status").unwrap(), 11)
-                .unwrap_err()
-                .code,
+            request_limited.admit(true, 11).unwrap_err().code,
             ProtocolErrorCode::QuotaExceeded
         );
-        request_limited
-            .admit(&Token::new("operation.status").unwrap(), 110)
-            .unwrap();
+        request_limited.admit(true, 110).unwrap();
 
         let journal_limited = EndpointQuota::new(2, 10, 100, 1, 100).unwrap();
-        let first = journal_limited
-            .admit(&Token::new("signer.sign").unwrap(), 20)
-            .unwrap();
+        let first = journal_limited.admit(false, 20).unwrap();
         drop(first);
         assert_eq!(
-            journal_limited
-                .admit(&Token::new("signer.sign").unwrap(), 21)
-                .unwrap_err()
-                .code,
+            journal_limited.admit(false, 21).unwrap_err().code,
             ProtocolErrorCode::QuotaExceeded
         );
     }

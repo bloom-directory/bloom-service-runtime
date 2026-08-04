@@ -1,19 +1,17 @@
 [package]
-name = "bloom-audit-checkpoint"
+name = "bloom-rpc-wire"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
-bloom-rpc-wire.workspace = true
+base64.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 serde.workspace = true
-serde_jcs.workspace = true
 serde_json.workspace = true
+serde_jcs.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

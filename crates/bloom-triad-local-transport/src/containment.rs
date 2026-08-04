@@ -1,13 +1,14 @@
 //! Verification of the root-owned macOS packet-filter health attestation.
 
 use std::{
+    collections::BTreeMap,
     fs,
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use bloom_triad_protocol::{Digest32, ProtocolError, ProtocolErrorCode};
+use bloom_rpc_wire::{Digest32, WireError as ProtocolError, WireErrorCode as ProtocolErrorCode};
 use serde::Deserialize;
 
 const STATUS_SCHEMA: &str = "bloom.macos-platform-status.3";
@@ -23,7 +24,6 @@ pub struct NetworkContainmentGuard {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NetworkContainmentStatus {
     schema: String,
     login_uid: u32,
@@ -33,9 +33,10 @@ struct NetworkContainmentStatus {
     automatic_time_enabled: bool,
     timed_service_loaded: bool,
     trusted_time_available: bool,
-    ceremony_listener_bloom_shaped: bool,
     checked_at_unix_ms: u64,
     available: bool,
+    #[serde(flatten)]
+    extension_claims: BTreeMap<String, serde_json::Value>,
 }
 
 impl NetworkContainmentGuard {
@@ -60,9 +61,15 @@ impl NetworkContainmentGuard {
         self.read_validated_status().map(|_| ())
     }
 
-    pub fn ceremony_listener_bloom_shaped(&self) -> Result<bool, ProtocolError> {
-        self.read_validated_status()
-            .map(|status| status.ceremony_listener_bloom_shaped)
+    /// Reads a consumer-owned boolean claim after validating the common,
+    /// root-owned containment attestation.
+    pub fn boolean_claim(&self, name: &str) -> Result<Option<bool>, ProtocolError> {
+        self.read_validated_status().map(|status| {
+            status
+                .extension_claims
+                .get(name)
+                .and_then(|value| value.as_bool())
+        })
     }
 
     fn read_validated_status(&self) -> Result<NetworkContainmentStatus, ProtocolError> {
@@ -152,7 +159,7 @@ mod tests {
             "automatic_time_enabled": trusted_time_available,
             "timed_service_loaded": trusted_time_available,
             "trusted_time_available": trusted_time_available,
-            "ceremony_listener_bloom_shaped": false,
+            "fixture_boolean_claim": false,
             "checked_at_unix_ms": checked_at_unix_ms,
             "available": available,
         }))
@@ -170,7 +177,13 @@ mod tests {
             3_000,
         )
         .unwrap();
-        assert!(!validated.ceremony_listener_bloom_shaped);
+        assert_eq!(
+            validated
+                .extension_claims
+                .get("fixture_boolean_claim")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
         for rejected in [
             status(false, TRUSTED_TIME_SOURCE, true, 10_000),
             status(true, TRUSTED_TIME_SOURCE, false, 10_000),
