@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/bloom-audit-checkpoint",
+  "crates/bloom-platform-containment",
   "crates/bloom-rpc-wire",
   "crates/bloom-service-activation",
   "crates/bloom-triad-local-transport",

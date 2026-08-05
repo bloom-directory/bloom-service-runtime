@@ -45,6 +45,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-platform-containment"
+version = "0.1.3"
+dependencies = [
+ "bloom-rpc-wire",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bloom-rpc-wire"
 version = "0.1.3"
 dependencies = [

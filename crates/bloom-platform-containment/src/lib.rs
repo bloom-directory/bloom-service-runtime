@@ -1,5 +1,8 @@
 //! Verification of the root-owned macOS packet-filter health attestation.
 
+#![forbid(unsafe_code)]
+#![cfg(unix)]
+
 use std::{
     collections::BTreeMap,
     fs,

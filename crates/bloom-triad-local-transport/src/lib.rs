@@ -3,10 +3,7 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
-mod containment;
-
 pub use bloom_rpc_wire::{WireError as TransportError, WireErrorCode as TransportErrorCode};
-pub use containment::NetworkContainmentGuard;
 
 use std::{
     collections::VecDeque,
