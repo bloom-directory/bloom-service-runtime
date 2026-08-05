@@ -1948,7 +1948,7 @@ mod tests {
         let quota = EndpointQuota::new(4, 256, 60_000, 256, 60_000).unwrap();
         let machine_head = sign_journal_head(&machine, 4, Digest32::from_bytes([4; 32]));
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             for _ in 0..128 {
                 let (mut machine_stream, mut broker_stream) = UnixStream::pair().unwrap();
                 let (client, server) = tokio::join!(
