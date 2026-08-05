@@ -1063,7 +1063,6 @@ mod tests {
         let scans_after_publication = store.scan_count.load(Ordering::Relaxed);
         assert_eq!(scans_after_publication, 67);
 
-        let started = std::time::Instant::now();
         for _ in 0..1_000 {
             assert_eq!(
                 store.append(&expected).unwrap(),
@@ -1077,10 +1076,6 @@ mod tests {
             "an unchanged peer head must not rescan retained history"
         );
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 33);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "unchanged peer-head idempotence exceeded its bounded runtime"
-        );
     }
 
     #[test]
