@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Assert product repos are absent
+        run: |
+          if grep -Fq 'source = "git+https://github.com/bloom-directory/bloom.git' Cargo.lock ||
+             grep -Fq 'source = "git+https://github.com/bloom-directory/bloom-broker.git' Cargo.lock ||
+             grep -Fq 'source = "git+https://github.com/bloom-directory/bloom-signer.git' Cargo.lock; then
+            echo 'Cargo.lock must not resolve packages from Bloom, Broker, or Signer repositories' >&2
+            exit 1
+          fi
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace --all-features --locked
+
+  macos_w0_launchd:
+    name: macOS W0 launchd listener retry
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Exercise real launchd socket ownership and retry
+        env:
+          BLOOM_RUN_MACOS_LAUNCHD_W0: "1"
+        run: >
+          cargo test -p bloom-service-activation
+          --test macos_launchd_retry
+          --locked
+          -- --nocapture
+
+  linux_uid_isolation:
+    name: Linux W0 UID isolation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Build UID-isolation test as the unprivileged runner
+        id: linux-w0-test
+        run: |
+          executable="$(
+            cargo test -p bloom-service-activation --test linux_uid_isolation \
+              --locked --no-run --message-format=json |
+              jq -r 'select(.profile.test == true and .target.name == "linux_uid_isolation") | .executable' |
+              tail -n 1
+          )"
+          test -n "$executable"
+          test -x "$executable"
+          echo "executable=$executable" >> "$GITHUB_OUTPUT"
+      - name: Prove Machine denial and Broker-to-Signer access under distinct UIDs
+        env:
+          TEST_EXECUTABLE: ${{ steps.linux-w0-test.outputs.executable }}
+        run: sudo env BLOOM_RUN_LINUX_PRIVILEGED_W0=1 "$TEST_EXECUTABLE" --nocapture
