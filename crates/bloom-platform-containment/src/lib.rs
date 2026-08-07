@@ -15,7 +15,6 @@ use bloom_rpc_wire::{Digest32, WireError as ProtocolError, WireErrorCode as Prot
 use serde::Deserialize;
 
 const STATUS_SCHEMA: &str = "bloom.macos-platform-status.3";
-const TRUSTED_TIME_SOURCE: &str = "macos-managed-timed";
 const MAX_FUTURE_SKEW_MS: u64 = 1_000;
 
 #[derive(Clone)]
@@ -121,13 +120,18 @@ fn validate_status(
     let status: NetworkContainmentStatus = serde_json::from_slice(bytes)
         .map_err(|error| unavailable(format!("decode containment status: {error}")))?;
     let _anchor_digest = &status.anchor_sha256;
+    // These fields remain in schema v3 for compatibility and telemetry, but
+    // they are not containment claims. Changing the macOS host clock requires
+    // administrator authority, which is outside Bloom's service boundary.
+    let _legacy_time_claims = (
+        &status.trusted_time_source,
+        status.automatic_time_enabled,
+        status.timed_service_loaded,
+        status.trusted_time_available,
+    );
     if status.schema != STATUS_SCHEMA
         || status.login_uid != login_uid
         || &status.build_digest != build_digest
-        || status.trusted_time_source != TRUSTED_TIME_SOURCE
-        || !status.automatic_time_enabled
-        || !status.timed_service_loaded
-        || !status.trusted_time_available
         || !status.available
         || status.checked_at_unix_ms > now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
         || now_ms.saturating_sub(status.checked_at_unix_ms) > maximum_age_ms
@@ -173,7 +177,7 @@ mod tests {
     fn containment_status_is_exact_build_uid_available_and_fresh() {
         let digest = Digest32::new("11".repeat(32)).unwrap();
         let validated = validate_status(
-            &status(true, TRUSTED_TIME_SOURCE, true, 10_000),
+            &status(true, "macos-managed-timed", true, 10_000),
             501,
             &digest,
             12_000,
@@ -187,12 +191,18 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(false)
         );
+        validate_status(
+            &status(true, "peer-supplied-time", false, 10_000),
+            501,
+            &digest,
+            12_000,
+            3_000,
+        )
+        .expect("legacy time telemetry must not gate network containment");
         for rejected in [
-            status(false, TRUSTED_TIME_SOURCE, true, 10_000),
-            status(true, TRUSTED_TIME_SOURCE, false, 10_000),
-            status(true, "peer-supplied-time", true, 10_000),
-            status(true, TRUSTED_TIME_SOURCE, true, 8_999),
-            status(true, TRUSTED_TIME_SOURCE, true, 13_001),
+            status(false, "macos-managed-timed", true, 10_000),
+            status(true, "macos-managed-timed", true, 8_999),
+            status(true, "macos-managed-timed", true, 13_001),
         ] {
             assert_eq!(
                 validate_status(&rejected, 501, &digest, 12_000, 3_000)
@@ -203,7 +213,7 @@ mod tests {
         }
         assert!(
             validate_status(
-                &status(true, TRUSTED_TIME_SOURCE, true, 10_000),
+                &status(true, "peer-supplied-time", false, 10_000),
                 502,
                 &digest,
                 12_000,
@@ -213,7 +223,7 @@ mod tests {
         );
         assert!(
             validate_status(
-                &status(true, TRUSTED_TIME_SOURCE, true, 10_000),
+                &status(true, "peer-supplied-time", false, 10_000),
                 501,
                 &Digest32::new("33".repeat(32)).unwrap(),
                 12_000,

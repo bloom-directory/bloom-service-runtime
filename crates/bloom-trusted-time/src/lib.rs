@@ -31,6 +31,22 @@ impl TrustedTimeSource {
             Self::MacosManagedTimed => "macos-managed-timed",
         }
     }
+
+    /// Whether Bloom must maintain a durable discontinuity guard in addition
+    /// to the platform wall clock.
+    ///
+    /// Linux's reviewed profile uses authenticated NTS and can distinguish a
+    /// synchronized source from an arbitrary wall-clock value. On macOS,
+    /// changing the host clock is an administrator operation; administrator
+    /// compromise is outside Bloom's local service boundary, so persisting a
+    /// second effective clock adds failure modes without adding authority
+    /// separation.
+    pub const fn requires_durable_clock_guard(self) -> bool {
+        match self {
+            Self::LinuxChronyNts => true,
+            Self::MacosManagedTimed => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,11 +159,10 @@ fn source_is_synchronized(source: TrustedTimeSource) -> bool {
 
 #[cfg(target_os = "macos")]
 fn source_is_synchronized(source: TrustedTimeSource) -> bool {
-    // macOS `timed` merges several reference-clock technologies and does not
-    // expose its trust state through the kernel NTP discipline queried by
-    // `ntp_adjtime`. Production services accept this wall clock only while
-    // their separate, fresh root-owned platform status attests that automatic
-    // network time is enabled and com.apple.timed is loaded.
+    // macOS does not expose `timed` trust through the kernel NTP discipline.
+    // The host wall clock is therefore authoritative for this profile; an
+    // administrator able to change it is already outside Bloom's service
+    // isolation boundary.
     source == TrustedTimeSource::MacosManagedTimed
 }
 
@@ -238,6 +253,12 @@ mod tests {
         assert!(TrustedTimeSource::for_current_platform("macos-managed-timed").is_err());
         #[cfg(target_os = "macos")]
         assert!(TrustedTimeSource::for_current_platform("linux-chrony-nts").is_err());
+    }
+
+    #[test]
+    fn only_authenticated_linux_time_uses_the_durable_guard() {
+        assert!(TrustedTimeSource::LinuxChronyNts.requires_durable_clock_guard());
+        assert!(!TrustedTimeSource::MacosManagedTimed.requires_durable_clock_guard());
     }
 
     #[test]
