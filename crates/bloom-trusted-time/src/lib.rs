@@ -56,6 +56,99 @@ pub struct PlatformTimeReading {
     pub monotonic_elapsed_ms: u64,
 }
 
+/// The service-owned subset of durable clock state needed to evaluate the
+/// next trusted-time observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistedClockState {
+    pub last_effective_ms: u64,
+    pub monotonic_anchor_ns: u64,
+}
+
+/// A neutral trusted-time outcome. Services remain responsible for mapping
+/// this into their protocol types and for persisting/auditing the transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableClockCondition {
+    Healthy,
+    Untrusted,
+    RollbackFrozen,
+    ForwardJumpRejected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableClockDecision {
+    pub effective_now_ms: u64,
+    pub condition: DurableClockCondition,
+}
+
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum DurableClockError {
+    #[error("monotonic clock arithmetic overflow")]
+    ArithmeticOverflow,
+}
+
+/// Evaluate a platform reading against durable clock state without performing
+/// storage, audit, readiness, or authority mutations.
+///
+/// A sampler's `monotonic_elapsed_ms` is process-relative and therefore starts
+/// at zero after a service restart. When a non-zero absolute monotonic anchor
+/// was persisted and the current anchor has not moved backwards, its delta
+/// supplies restart-safe elapsed time in the same continuous-clock domain.
+/// Legacy zero anchors and anchor rollback remain fail-closed by falling back
+/// to the bounded process-relative elapsed reading.
+pub fn evaluate_durable_clock(
+    previous: Option<PersistedClockState>,
+    reading: &PlatformTimeReading,
+    max_forward_step_ms: u64,
+) -> Result<DurableClockDecision, DurableClockError> {
+    let Some(utc_ms) = reading.utc_ms else {
+        return Ok(DurableClockDecision {
+            effective_now_ms: previous.map_or(0, |state| state.last_effective_ms),
+            condition: DurableClockCondition::Untrusted,
+        });
+    };
+    let Some(previous) = previous else {
+        return Ok(DurableClockDecision {
+            effective_now_ms: utc_ms,
+            condition: DurableClockCondition::Healthy,
+        });
+    };
+
+    let monotonic_now = previous
+        .last_effective_ms
+        .checked_add(elapsed_since_persisted_anchor(
+            previous.monotonic_anchor_ns,
+            reading,
+        ))
+        .ok_or(DurableClockError::ArithmeticOverflow)?;
+    if utc_ms < previous.last_effective_ms {
+        return Ok(DurableClockDecision {
+            effective_now_ms: previous.last_effective_ms,
+            condition: DurableClockCondition::RollbackFrozen,
+        });
+    }
+    if utc_ms > monotonic_now.saturating_add(max_forward_step_ms) {
+        return Ok(DurableClockDecision {
+            effective_now_ms: monotonic_now,
+            condition: DurableClockCondition::ForwardJumpRejected,
+        });
+    }
+    Ok(DurableClockDecision {
+        effective_now_ms: utc_ms.max(monotonic_now),
+        condition: DurableClockCondition::Healthy,
+    })
+}
+
+fn elapsed_since_persisted_anchor(persisted_anchor_ns: u64, reading: &PlatformTimeReading) -> u64 {
+    if persisted_anchor_ns != 0 {
+        if let Some(anchor_elapsed_ns) =
+            reading.monotonic_anchor_ns.checked_sub(persisted_anchor_ns)
+        {
+            return (anchor_elapsed_ns / 1_000_000).max(reading.monotonic_elapsed_ms);
+        }
+    }
+    reading.monotonic_elapsed_ms
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TrustedTimeError {
     #[error("trusted time source {0:?} does not match this platform or reviewed packaging")]
@@ -335,5 +428,172 @@ mod tests {
             advance_sample_state(&mut state, before_suspend + two_hours_ns).unwrap(),
             2 * 60 * 60 * 1_000
         );
+    }
+
+    #[test]
+    fn durable_clock_initializes_and_freezes_without_trusted_utc() {
+        let reading = PlatformTimeReading {
+            utc_ms: Some(10_000),
+            monotonic_anchor_ns: 1_000_000_000,
+            monotonic_elapsed_ms: 0,
+        };
+        assert_eq!(
+            evaluate_durable_clock(None, &reading, MAX_FORWARD_STEP_MS).unwrap(),
+            DurableClockDecision {
+                effective_now_ms: 10_000,
+                condition: DurableClockCondition::Healthy,
+            }
+        );
+        assert_eq!(
+            evaluate_durable_clock(
+                Some(PersistedClockState {
+                    last_effective_ms: 10_000,
+                    monotonic_anchor_ns: reading.monotonic_anchor_ns,
+                }),
+                &PlatformTimeReading {
+                    utc_ms: None,
+                    monotonic_anchor_ns: 2_000_000_000,
+                    monotonic_elapsed_ms: 1_000,
+                },
+                MAX_FORWARD_STEP_MS,
+            )
+            .unwrap(),
+            DurableClockDecision {
+                effective_now_ms: 10_000,
+                condition: DurableClockCondition::Untrusted,
+            }
+        );
+    }
+
+    #[test]
+    fn durable_clock_restart_credits_absolute_monotonic_downtime() {
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        let decision = evaluate_durable_clock(
+            Some(PersistedClockState {
+                last_effective_ms: 10_000,
+                monotonic_anchor_ns: 1_000_000_000,
+            }),
+            &PlatformTimeReading {
+                utc_ms: Some(10_000 + two_hours_ms),
+                monotonic_anchor_ns: 1_000_000_000 + two_hours_ms * 1_000_000,
+                monotonic_elapsed_ms: 0,
+            },
+            MAX_FORWARD_STEP_MS,
+        )
+        .unwrap();
+        assert_eq!(
+            decision,
+            DurableClockDecision {
+                effective_now_ms: 10_000 + two_hours_ms,
+                condition: DurableClockCondition::Healthy,
+            }
+        );
+    }
+
+    #[test]
+    fn durable_clock_anchor_rollback_and_legacy_zero_stay_fail_closed() {
+        let two_hours_ms = 2 * 60 * 60 * 1_000;
+        for persisted_anchor_ns in [0, 1_000_000_000] {
+            let current_anchor_ns = if persisted_anchor_ns == 0 {
+                9_999_999_999
+            } else {
+                persisted_anchor_ns - 1
+            };
+            let decision = evaluate_durable_clock(
+                Some(PersistedClockState {
+                    last_effective_ms: 10_000,
+                    monotonic_anchor_ns: persisted_anchor_ns,
+                }),
+                &PlatformTimeReading {
+                    utc_ms: Some(10_000 + two_hours_ms),
+                    monotonic_anchor_ns: current_anchor_ns,
+                    monotonic_elapsed_ms: 0,
+                },
+                MAX_FORWARD_STEP_MS,
+            )
+            .unwrap();
+            assert_eq!(
+                decision,
+                DurableClockDecision {
+                    effective_now_ms: 10_000,
+                    condition: DurableClockCondition::ForwardJumpRejected,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn durable_clock_preserves_rollback_and_same_process_semantics() {
+        let previous = Some(PersistedClockState {
+            last_effective_ms: 10_000,
+            monotonic_anchor_ns: 1_000_000_000,
+        });
+        assert_eq!(
+            evaluate_durable_clock(
+                previous,
+                &PlatformTimeReading {
+                    utc_ms: Some(9_999),
+                    monotonic_anchor_ns: 1_050_000_000,
+                    monotonic_elapsed_ms: 50,
+                },
+                MAX_FORWARD_STEP_MS,
+            )
+            .unwrap()
+            .condition,
+            DurableClockCondition::RollbackFrozen
+        );
+        assert_eq!(
+            evaluate_durable_clock(
+                previous,
+                &PlatformTimeReading {
+                    utc_ms: Some(10_050),
+                    monotonic_anchor_ns: 1_050_000_000,
+                    monotonic_elapsed_ms: 50,
+                },
+                MAX_FORWARD_STEP_MS,
+            )
+            .unwrap(),
+            DurableClockDecision {
+                effective_now_ms: 10_050,
+                condition: DurableClockCondition::Healthy,
+            }
+        );
+    }
+
+    #[test]
+    fn durable_clock_retains_larger_sampler_elapsed_remainder() {
+        let decision = evaluate_durable_clock(
+            Some(PersistedClockState {
+                last_effective_ms: 10_000,
+                monotonic_anchor_ns: 1_000_000_000,
+            }),
+            &PlatformTimeReading {
+                utc_ms: Some(10_002),
+                monotonic_anchor_ns: 1_001_500_000,
+                monotonic_elapsed_ms: 2,
+            },
+            MAX_FORWARD_STEP_MS,
+        )
+        .unwrap();
+        assert_eq!(decision.effective_now_ms, 10_002);
+        assert_eq!(decision.condition, DurableClockCondition::Healthy);
+    }
+
+    #[test]
+    fn durable_clock_reports_monotonic_arithmetic_overflow() {
+        let error = evaluate_durable_clock(
+            Some(PersistedClockState {
+                last_effective_ms: u64::MAX,
+                monotonic_anchor_ns: 1,
+            }),
+            &PlatformTimeReading {
+                utc_ms: Some(u64::MAX),
+                monotonic_anchor_ns: 1_000_001,
+                monotonic_elapsed_ms: 1,
+            },
+            MAX_FORWARD_STEP_MS,
+        )
+        .unwrap_err();
+        assert_eq!(error, DurableClockError::ArithmeticOverflow);
     }
 }
