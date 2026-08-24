@@ -98,7 +98,12 @@ pub enum DurableClockError {
 /// was persisted and the current anchor has not moved backwards, its delta
 /// supplies restart-safe elapsed time in the same continuous-clock domain.
 /// Legacy zero anchors and anchor rollback remain fail-closed by falling back
-/// to the bounded process-relative elapsed reading.
+/// to the bounded process-relative elapsed reading. A zero effective-time
+/// sentinel is different: it records that the service started before the
+/// trusted UTC source became available and has never established an epoch.
+/// The first subsequently trusted UTC sample initializes that sentinel. This
+/// transition only moves authority time forward, so existing expirations can
+/// shorten but can never be extended.
 pub fn evaluate_durable_clock(
     previous: Option<PersistedClockState>,
     reading: &PlatformTimeReading,
@@ -117,6 +122,12 @@ pub fn evaluate_durable_clock(
             condition: DurableClockCondition::Healthy,
         });
     };
+    if previous.last_effective_ms == 0 {
+        return Ok(DurableClockDecision {
+            effective_now_ms: utc_ms,
+            condition: DurableClockCondition::Healthy,
+        });
+    }
 
     let monotonic_now = previous
         .last_effective_ms
@@ -497,6 +508,34 @@ mod tests {
                 effective_now_ms: 10_000,
                 condition: DurableClockCondition::Untrusted,
             }
+        );
+    }
+
+    #[test]
+    fn durable_clock_initializes_a_persisted_zero_effective_time() {
+        let utc_ms = 1_787_279_361_000;
+        let decision = evaluate_durable_clock(
+            Some(PersistedClockState {
+                last_effective_ms: 0,
+                monotonic_anchor_ns: 42_000_000_000,
+                boot_epoch: Some(EPOCH_A),
+            }),
+            &PlatformTimeReading {
+                utc_ms: Some(utc_ms),
+                monotonic_anchor_ns: 43_000_000_000,
+                monotonic_elapsed_ms: 0,
+            },
+            Some(EPOCH_A),
+            MAX_FORWARD_STEP_MS,
+        )
+        .unwrap();
+        assert_eq!(
+            decision,
+            DurableClockDecision {
+                effective_now_ms: utc_ms,
+                condition: DurableClockCondition::Healthy,
+            },
+            "a persisted zero means no trusted epoch was ever established"
         );
     }
 
