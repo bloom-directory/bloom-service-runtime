@@ -36,6 +36,7 @@ dependencies = [
  "bloom-rpc-wire",
  "ed25519-dalek",
  "hex",
+ "rustix",
  "serde",
  "serde_jcs",
  "serde_json",
