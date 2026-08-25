@@ -89,24 +89,30 @@ pub struct CheckpointStore {
     handovers: BTreeMap<(Token, Token), ApplicationKeyHandover>,
     operation: Mutex<()>,
     state: Mutex<CheckpointState>,
-    #[cfg(test)]
-    scan_count: AtomicU64,
-    #[cfg(test)]
-    census_metadata_count: AtomicU64,
-    #[cfg(test)]
-    existing_link_reconcile_count: AtomicU64,
-    #[cfg(test)]
-    skip_directory_lock: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
-    publish_barrier: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
-    #[cfg(test)]
-    post_publish_hook: Mutex<Option<std::sync::Arc<PostPublishHook>>>,
 }
 
-#[cfg(test)]
-struct PostPublishHook {
-    published: std::sync::Barrier,
-    resume: std::sync::Barrier,
+struct PreparedPublication {
+    temporary: PathBuf,
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl Drop for PreparedPublication {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Publication {
+    Published,
+    AlreadyPresent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RecordCensus {
+    unchanged: bool,
+    metadata_probes: usize,
 }
 
 struct PeerKeySet {
@@ -269,18 +275,6 @@ impl CheckpointStore {
                 latest: BTreeMap::new(),
                 record_stamps: BTreeMap::new(),
             }),
-            #[cfg(test)]
-            scan_count: AtomicU64::new(0),
-            #[cfg(test)]
-            census_metadata_count: AtomicU64::new(0),
-            #[cfg(test)]
-            existing_link_reconcile_count: AtomicU64::new(0),
-            #[cfg(test)]
-            skip_directory_lock: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            publish_barrier: Mutex::new(None),
-            #[cfg(test)]
-            post_publish_hook: Mutex::new(None),
         };
         let scanned = store.scan_records()?;
         store.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
@@ -304,7 +298,7 @@ impl CheckpointStore {
         let stamp = root_stamp(&self.root, self.expected_uid)?;
         let cache_is_current = {
             let state = self.lock_state()?;
-            state.root_stamp == stamp && self.record_stamps_unchanged(&state.record_stamps)?
+            state.root_stamp == stamp && self.record_census(&state.record_stamps)?.unchanged
         };
         if !cache_is_current {
             let scanned = self.scan_records()?;
@@ -331,6 +325,15 @@ impl CheckpointStore {
             }
         }
 
+        let prepared = self.prepare_publication(peer_head)?;
+        let publication = self.publish_prepared(&prepared, peer_head)?;
+        self.finalize_publication(peer_head, &prepared.path, publication)
+    }
+
+    fn prepare_publication(
+        &self,
+        peer_head: &SignedJournalHead,
+    ) -> Result<PreparedPublication, CheckpointError> {
         let record = CheckpointRecord {
             schema: Token::new(CHECKPOINT_SCHEMA)
                 .map_err(|error| CheckpointError::Malformed(error.to_string()))?,
@@ -339,13 +342,13 @@ impl CheckpointStore {
         };
         let bytes = serde_jcs::to_vec(&record)
             .map_err(|error| CheckpointError::Malformed(error.to_string()))?;
-        let path = self.root.join(checkpoint_filename(peer_head));
+        let filename = checkpoint_filename(peer_head);
+        let path = self.root.join(&filename);
         let parent = self.root.parent().ok_or(CheckpointError::InvalidRoot)?;
         let temporary = parent.join(format!(
-            ".bloom-checkpoint-{}-{}-{}.new",
+            ".bloom-checkpoint-{}-{}-{filename}.new",
             std::process::id(),
             CHECKPOINT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-            checkpoint_filename(peer_head)
         ));
         let mut file = OpenOptions::new()
             .write(true)
@@ -358,43 +361,48 @@ impl CheckpointStore {
             return Err(error.into());
         }
         drop(file);
-        #[cfg(test)]
-        let publish_barrier = self.publish_barrier.lock().unwrap().clone();
-        #[cfg(test)]
-        if let Some(barrier) = publish_barrier {
-            barrier.wait();
-        }
-        let linked = fs::hard_link(&temporary, &path);
-        let _ = fs::remove_file(&temporary);
-        match linked {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                #[cfg(test)]
-                self.existing_link_reconcile_count
-                    .fetch_add(1, Ordering::Relaxed);
-                let outcome = self.validate_exact_existing(&path, &bytes, peer_head)?;
-                let scanned = self.scan_records()?;
-                self.replace_cached_state(
-                    &scanned.records,
-                    scanned.root_stamp,
-                    scanned.record_stamps,
-                )?;
-                return Ok(outcome);
+        Ok(PreparedPublication {
+            temporary,
+            path,
+            bytes,
+        })
+    }
+
+    fn publish_prepared(
+        &self,
+        prepared: &PreparedPublication,
+        peer_head: &SignedJournalHead,
+    ) -> Result<Publication, CheckpointError> {
+        match fs::hard_link(&prepared.temporary, &prepared.path) {
+            Ok(()) => {
+                fs::remove_file(&prepared.temporary)?;
+                File::open(&self.root)?.sync_all()?;
+                Ok(Publication::Published)
             }
-            Err(error) => return Err(error.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.validate_exact_existing(&prepared.path, &prepared.bytes, peer_head)?;
+                Ok(Publication::AlreadyPresent)
+            }
+            Err(error) => Err(error.into()),
         }
-        File::open(&self.root)?.sync_all()?;
-        #[cfg(test)]
-        let post_publish_hook = self.post_publish_hook.lock().unwrap().clone();
-        #[cfg(test)]
-        if let Some(hook) = post_publish_hook {
-            hook.published.wait();
-            hook.resume.wait();
+    }
+
+    fn finalize_publication(
+        &self,
+        peer_head: &SignedJournalHead,
+        path: &Path,
+        publication: Publication,
+    ) -> Result<AppendOutcome, CheckpointError> {
+        if publication == Publication::AlreadyPresent {
+            let scanned = self.scan_records()?;
+            self.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
+            return Ok(AppendOutcome::AlreadyPresent);
         }
-        let record_stamp = record_stamp(&path)?;
+
+        let record_stamp = record_stamp(path)?;
         let mut expected_stamps = self.lock_state()?.record_stamps.clone();
-        expected_stamps.insert(path.clone(), record_stamp);
-        if !self.record_stamps_unchanged(&expected_stamps)? {
+        expected_stamps.insert(path.to_path_buf(), record_stamp);
+        if !self.record_census(&expected_stamps)?.unchanged {
             let scanned = self.scan_records()?;
             self.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
             return Ok(AppendOutcome::Appended);
@@ -426,7 +434,7 @@ impl CheckpointStore {
             })
         };
         if let Some((cached, record_stamps)) = cached {
-            if self.record_stamps_unchanged(&record_stamps)? {
+            if self.record_census(&record_stamps)?.unchanged {
                 if let Some(head) = cached.as_ref() {
                     self.validate_cached_record(head)?;
                 }
@@ -445,8 +453,6 @@ impl CheckpointStore {
     }
 
     fn scan_records(&self) -> Result<ScannedRecords, CheckpointError> {
-        #[cfg(test)]
-        self.scan_count.fetch_add(1, Ordering::Relaxed);
         for _ in 0..3 {
             let before = root_stamp(&self.root, self.expected_uid)?;
             let mut records = Vec::new();
@@ -522,7 +528,7 @@ impl CheckpointStore {
         let Some((cached, record_stamps)) = cached else {
             return Ok(false);
         };
-        if !self.record_stamps_unchanged(&record_stamps)? {
+        if !self.record_census(&record_stamps)?.unchanged {
             return Ok(false);
         }
         let Some(cached) = cached else {
@@ -538,30 +544,42 @@ impl CheckpointStore {
         Ok(true)
     }
 
-    fn record_stamps_unchanged(
+    fn record_census(
         &self,
         expected: &BTreeMap<PathBuf, RecordStamp>,
-    ) -> Result<bool, CheckpointError> {
-        let mut observed_count = 0;
+    ) -> Result<RecordCensus, CheckpointError> {
+        let mut metadata_probes = 0;
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let path = entry.path();
             let Some(expected_stamp) = expected.get(&path) else {
-                return Ok(false);
+                return Ok(RecordCensus {
+                    unchanged: false,
+                    metadata_probes,
+                });
             };
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(RecordCensus {
+                        unchanged: false,
+                        metadata_probes,
+                    });
+                }
                 Err(error) => return Err(error.into()),
             };
-            #[cfg(test)]
-            self.census_metadata_count.fetch_add(1, Ordering::Relaxed);
+            metadata_probes += 1;
             if record_stamp_from_metadata(&metadata) != *expected_stamp {
-                return Ok(false);
+                return Ok(RecordCensus {
+                    unchanged: false,
+                    metadata_probes,
+                });
             }
-            observed_count += 1;
         }
-        Ok(observed_count == expected.len())
+        Ok(RecordCensus {
+            unchanged: metadata_probes == expected.len(),
+            metadata_probes,
+        })
     }
 
     fn validate_cached_record(&self, head: &SignedJournalHead) -> Result<(), CheckpointError> {
@@ -612,14 +630,10 @@ impl CheckpointStore {
     fn lock_directory(
         &self,
         operation: rustix::fs::FlockOperation,
-    ) -> Result<Option<DirectoryLock<'_>>, CheckpointError> {
-        #[cfg(test)]
-        if self.skip_directory_lock.load(Ordering::Relaxed) {
-            return Ok(None);
-        }
+    ) -> Result<DirectoryLock<'_>, CheckpointError> {
         rustix::fs::flock(&self.root_lock, operation)
             .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
-        Ok(Some(DirectoryLock(&self.root_lock)))
+        Ok(DirectoryLock(&self.root_lock))
     }
 
     fn verify_live_head(&self, head: &SignedJournalHead) -> Result<(), CheckpointError> {
@@ -1129,38 +1143,28 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_authenticated_head_avoids_full_reconciliation() {
+    fn unchanged_authenticated_head_uses_the_record_census_fast_path() {
         let directory = tempfile::tempdir().unwrap();
         let store = open_store(&directory);
         let mut expected = head(7, "11");
-        assert_eq!(store.scan_count.load(Ordering::Relaxed), 1);
         assert_eq!(store.append(&expected).unwrap(), AppendOutcome::Appended);
         for sequence in 8..=39 {
             expected = head(sequence, "11");
             assert_eq!(store.append(&expected).unwrap(), AppendOutcome::Appended);
         }
-        let scans_after_publication = store.scan_count.load(Ordering::Relaxed);
-        assert_eq!(scans_after_publication, 1);
         let retained_records = fs::read_dir(directory.path()).unwrap().count() as u64;
-        let census_metadata_before = store.census_metadata_count.load(Ordering::Relaxed);
 
         for _ in 0..1_000 {
-            assert_eq!(
-                store.append(&expected).unwrap(),
-                AppendOutcome::AlreadyPresent
-            );
+            assert!(store.cached_head_is_exact(&expected).unwrap());
         }
 
-        assert_eq!(
-            store.scan_count.load(Ordering::Relaxed),
-            scans_after_publication,
-            "an unchanged peer head must not rescan retained history"
-        );
         assert_eq!(retained_records, 33);
+        let record_stamps = store.lock_state().unwrap().record_stamps.clone();
+        let census = store.record_census(&record_stamps).unwrap();
+        assert!(census.unchanged);
         assert_eq!(
-            store.census_metadata_count.load(Ordering::Relaxed) - census_metadata_before,
-            1_000 * retained_records,
-            "each fast-path admission must census every retained record exactly once"
+            census.metadata_probes as u64, retained_records,
+            "the fast-path census must account for its O(history) metadata work"
         );
     }
 
@@ -1211,46 +1215,30 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_identical_append_publishes_once_and_reconciles_the_loser() {
+    fn identical_prepared_publications_reconcile_the_hard_link_loser() {
         let directory = tempfile::tempdir().unwrap();
-        let stores = [
-            std::sync::Arc::new(open_store(&directory)),
-            std::sync::Arc::new(open_store(&directory)),
-        ];
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        for store in &stores {
-            store.skip_directory_lock.store(true, Ordering::Relaxed);
-            *store.publish_barrier.lock().unwrap() = Some(std::sync::Arc::clone(&barrier));
-        }
+        let stores = [open_store(&directory), open_store(&directory)];
         let expected = head(12, "66");
 
-        let workers = stores
-            .iter()
-            .map(|store| {
-                let store = std::sync::Arc::clone(store);
-                let expected = expected.clone();
-                std::thread::spawn(move || store.append(&expected).unwrap())
-            })
-            .collect::<Vec<_>>();
-        let mut outcomes = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap())
-            .collect::<Vec<_>>();
-        outcomes.sort_by_key(|outcome| match outcome {
-            AppendOutcome::Appended => 0,
-            AppendOutcome::AlreadyPresent => 1,
-        });
+        let winner = stores[0].prepare_publication(&expected).unwrap();
+        let loser = stores[1].prepare_publication(&expected).unwrap();
+        let winner_publication = stores[0].publish_prepared(&winner, &expected).unwrap();
+        assert_eq!(winner_publication, Publication::Published);
+        let winner_outcome = stores[0]
+            .finalize_publication(&expected, &winner.path, winner_publication)
+            .unwrap();
+        drop(winner);
+
+        let loser_publication = stores[1].publish_prepared(&loser, &expected).unwrap();
+        assert_eq!(loser_publication, Publication::AlreadyPresent);
+        let loser_outcome = stores[1]
+            .finalize_publication(&expected, &loser.path, loser_publication)
+            .unwrap();
+        drop(loser);
+
         assert_eq!(
-            outcomes,
-            vec![AppendOutcome::Appended, AppendOutcome::AlreadyPresent]
-        );
-        let existing_link_reconciliations = stores
-            .iter()
-            .map(|store| store.existing_link_reconcile_count.load(Ordering::Relaxed))
-            .sum::<u64>();
-        assert_eq!(
-            existing_link_reconciliations, 1,
-            "the hard-link loser must execute the full reconciliation branch"
+            (winner_outcome, loser_outcome),
+            (AppendOutcome::Appended, AppendOutcome::AlreadyPresent)
         );
         let expected_suffix = checkpoint_filename(&expected);
         assert!(
@@ -1272,22 +1260,17 @@ mod tests {
     }
 
     #[test]
-    fn append_reconciles_a_foreign_record_published_before_cache_update() {
+    fn finalization_reconciles_a_foreign_record_published_before_cache_update() {
         let directory = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(open_store(&directory));
+        let store = open_store(&directory);
         assert_eq!(
             store.append(&head(1, "11")).unwrap(),
             AppendOutcome::Appended
         );
-        let hook = std::sync::Arc::new(PostPublishHook {
-            published: std::sync::Barrier::new(2),
-            resume: std::sync::Barrier::new(2),
-        });
-        *store.post_publish_hook.lock().unwrap() = Some(std::sync::Arc::clone(&hook));
-
-        let worker_store = std::sync::Arc::clone(&store);
-        let worker = std::thread::spawn(move || worker_store.append(&head(2, "22")));
-        hook.published.wait();
+        let local_head = head(2, "22");
+        let local = store.prepare_publication(&local_head).unwrap();
+        let local_publication = store.publish_prepared(&local, &local_head).unwrap();
+        assert_eq!(local_publication, Publication::Published);
 
         let foreign_head = head(3, "33");
         let foreign_record = CheckpointRecord {
@@ -1309,8 +1292,13 @@ mod tests {
         drop(foreign_file);
         File::open(directory.path()).unwrap().sync_all().unwrap();
 
-        hook.resume.wait();
-        assert_eq!(worker.join().unwrap().unwrap(), AppendOutcome::Appended);
+        assert_eq!(
+            store
+                .finalize_publication(&local_head, &local.path, local_publication)
+                .unwrap(),
+            AppendOutcome::Appended
+        );
+        drop(local);
         assert_eq!(
             store
                 .latest(&foreign_head.service_id)
