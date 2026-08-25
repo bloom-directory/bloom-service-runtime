@@ -327,7 +327,7 @@ impl CheckpointStore {
 
         let prepared = self.prepare_publication(peer_head)?;
         let publication = self.publish_prepared(&prepared, peer_head)?;
-        self.finalize_publication(peer_head, &prepared.path, publication)
+        self.finalize_publication(peer_head, &prepared, publication)
     }
 
     fn prepare_publication(
@@ -390,7 +390,7 @@ impl CheckpointStore {
     fn finalize_publication(
         &self,
         peer_head: &SignedJournalHead,
-        path: &Path,
+        prepared: &PreparedPublication,
         publication: Publication,
     ) -> Result<AppendOutcome, CheckpointError> {
         if publication == Publication::AlreadyPresent {
@@ -399,9 +399,10 @@ impl CheckpointStore {
             return Ok(AppendOutcome::AlreadyPresent);
         }
 
-        let record_stamp = record_stamp(path)?;
+        self.validate_exact_record(&prepared.path, &prepared.bytes, peer_head)?;
+        let record_stamp = record_stamp(&prepared.path)?;
         let mut expected_stamps = self.lock_state()?.record_stamps.clone();
-        expected_stamps.insert(path.to_path_buf(), record_stamp);
+        expected_stamps.insert(prepared.path.clone(), record_stamp);
         if !self.record_census(&expected_stamps)?.unchanged {
             let scanned = self.scan_records()?;
             self.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
@@ -652,13 +653,13 @@ impl CheckpointStore {
         path: &Path,
         expected_bytes: &[u8],
         expected_head: &SignedJournalHead,
-    ) -> Result<AppendOutcome, CheckpointError> {
+    ) -> Result<(), CheckpointError> {
         self.validate_exact_record(path, expected_bytes, expected_head)?;
         // The competing publisher may not yet have completed its own directory
         // fsync.  Make the observed link durable before reporting idempotent
         // success to this caller as well.
         File::open(&self.root)?.sync_all()?;
-        Ok(AppendOutcome::AlreadyPresent)
+        Ok(())
     }
 
     fn validate_exact_record(
@@ -1225,14 +1226,14 @@ mod tests {
         let winner_publication = stores[0].publish_prepared(&winner, &expected).unwrap();
         assert_eq!(winner_publication, Publication::Published);
         let winner_outcome = stores[0]
-            .finalize_publication(&expected, &winner.path, winner_publication)
+            .finalize_publication(&expected, &winner, winner_publication)
             .unwrap();
         drop(winner);
 
         let loser_publication = stores[1].publish_prepared(&loser, &expected).unwrap();
         assert_eq!(loser_publication, Publication::AlreadyPresent);
         let loser_outcome = stores[1]
-            .finalize_publication(&expected, &loser.path, loser_publication)
+            .finalize_publication(&expected, &loser, loser_publication)
             .unwrap();
         drop(loser);
 
@@ -1294,7 +1295,7 @@ mod tests {
 
         assert_eq!(
             store
-                .finalize_publication(&local_head, &local.path, local_publication)
+                .finalize_publication(&local_head, &local, local_publication)
                 .unwrap(),
             AppendOutcome::Appended
         );
@@ -1308,6 +1309,32 @@ mod tests {
                 .get(),
             3
         );
+    }
+
+    #[test]
+    fn finalization_rejects_a_substituted_staging_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(&directory);
+        let expected = head(1, "11");
+        let prepared = store.prepare_publication(&expected).unwrap();
+        let replacement = prepared.temporary.with_extension("replacement");
+        let mut replacement_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&replacement)
+            .unwrap();
+        replacement_file.write_all(b"{}").unwrap();
+        replacement_file.sync_all().unwrap();
+        drop(replacement_file);
+        fs::rename(&replacement, &prepared.temporary).unwrap();
+
+        let publication = store.publish_prepared(&prepared, &expected).unwrap();
+        assert_eq!(publication, Publication::Published);
+        assert!(matches!(
+            store.finalize_publication(&expected, &prepared, publication),
+            Err(CheckpointError::SequenceConflict)
+        ));
     }
 
     #[test]
