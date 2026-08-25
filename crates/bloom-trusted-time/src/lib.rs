@@ -10,7 +10,7 @@ pub const MAX_FORWARD_STEP_MS: u64 = 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrustedTimeSource {
-    LinuxChronyNts,
+    LinuxSystemClock,
     MacosManagedTimed,
 }
 
@@ -18,7 +18,7 @@ impl TrustedTimeSource {
     pub fn for_current_platform(source_id: &str) -> Result<Self, TrustedTimeError> {
         match source_id {
             #[cfg(target_os = "linux")]
-            "linux-chrony-nts" => Ok(Self::LinuxChronyNts),
+            "linux-system-clock" => Ok(Self::LinuxSystemClock),
             #[cfg(target_os = "macos")]
             "macos-managed-timed" => Ok(Self::MacosManagedTimed),
             _ => Err(TrustedTimeError::SourceMismatch(source_id.to_owned())),
@@ -27,7 +27,7 @@ impl TrustedTimeSource {
 
     pub const fn source_id(self) -> &'static str {
         match self {
-            Self::LinuxChronyNts => "linux-chrony-nts",
+            Self::LinuxSystemClock => "linux-system-clock",
             Self::MacosManagedTimed => "macos-managed-timed",
         }
     }
@@ -35,15 +35,15 @@ impl TrustedTimeSource {
     /// Whether Bloom must maintain a durable discontinuity guard in addition
     /// to the platform wall clock.
     ///
-    /// Linux's reviewed profile uses authenticated NTS and can distinguish a
-    /// synchronized source from an arbitrary wall-clock value. On macOS,
+    /// Linux persists a floor and a suspend-aware monotonic anchor so an
+    /// unprivileged service cannot move authority time backwards. On macOS,
     /// changing the host clock is an administrator operation; administrator
     /// compromise is outside Bloom's local service boundary, so persisting a
     /// second effective clock adds failure modes without adding authority
     /// separation.
     pub const fn requires_durable_clock_guard(self) -> bool {
         match self {
-            Self::LinuxChronyNts => true,
+            Self::LinuxSystemClock => true,
             Self::MacosManagedTimed => false,
         }
     }
@@ -97,13 +97,13 @@ pub enum DurableClockError {
 /// at zero after a service restart. When a non-zero absolute monotonic anchor
 /// was persisted and the current anchor has not moved backwards, its delta
 /// supplies restart-safe elapsed time in the same continuous-clock domain.
-/// Legacy zero anchors and anchor rollback remain fail-closed by falling back
-/// to the bounded process-relative elapsed reading. A zero effective-time
-/// sentinel is different: it records that the service started before the
-/// trusted UTC source became available and has never established an epoch.
-/// The first subsequently trusted UTC sample initializes that sentinel. This
-/// transition only moves authority time forward, so existing expirations can
-/// shorten but can never be extended.
+/// Legacy zero anchors and anchor rollback in a confirmed matching boot remain
+/// fail-closed by falling back to the bounded process-relative elapsed
+/// reading. Across a reboot, monotonic anchors cannot measure powered-off time,
+/// so a nondecreasing wall clock is accepted while the durable floor still
+/// rejects rollback. A zero effective-time sentinel is initialized by the
+/// first available wall-clock sample. This transition only moves authority
+/// time forward, so existing expirations can shorten but can never be extended.
 pub fn evaluate_durable_clock(
     previous: Option<PersistedClockState>,
     reading: &PlatformTimeReading,
@@ -129,6 +129,7 @@ pub fn evaluate_durable_clock(
         });
     }
 
+    let same_boot = persisted_anchor_matches_current_boot(&previous, current_boot_epoch);
     let monotonic_now = previous
         .last_effective_ms
         .checked_add(elapsed_since_persisted_anchor(
@@ -143,7 +144,7 @@ pub fn evaluate_durable_clock(
             condition: DurableClockCondition::RollbackFrozen,
         });
     }
-    if utc_ms > monotonic_now.saturating_add(max_forward_step_ms) {
+    if same_boot && utc_ms > monotonic_now.saturating_add(max_forward_step_ms) {
         return Ok(DurableClockDecision {
             effective_now_ms: monotonic_now,
             condition: DurableClockCondition::ForwardJumpRejected,
@@ -166,18 +167,18 @@ pub fn evaluate_durable_clock(
 /// effective now, which is what the forward-step guard is measured against, so
 /// a large UTC step would then be accepted instead of rejected.
 ///
-/// The domain identifier decides. Anything other than a confirmed match — a
-/// different domain, or an unknown one on either side — falls back to the
-/// bounded process-relative reading, as legacy zero anchors already do.
+/// The domain identifier decides whether the persisted anchor can contribute
+/// elapsed time. Anything other than a confirmed match — a different domain,
+/// or an unknown one on either side — falls back to process-relative elapsed
+/// time. The caller separately limits forward jumps only within a confirmed
+/// boot; across reboot, rejecting elapsed wall time would make ordinary
+/// powered-off intervals indistinguishable from attacks and freeze the clock.
 fn elapsed_since_persisted_anchor(
     previous: &PersistedClockState,
     current_boot_epoch: Option<[u8; 16]>,
     reading: &PlatformTimeReading,
 ) -> u64 {
-    let same_domain = matches!(
-        (previous.boot_epoch, current_boot_epoch),
-        (Some(persisted), Some(current)) if persisted == current
-    );
+    let same_domain = persisted_anchor_matches_current_boot(previous, current_boot_epoch);
     if same_domain && previous.monotonic_anchor_ns != 0 {
         if let Some(anchor_elapsed_ns) = reading
             .monotonic_anchor_ns
@@ -187,6 +188,16 @@ fn elapsed_since_persisted_anchor(
         }
     }
     reading.monotonic_elapsed_ms
+}
+
+fn persisted_anchor_matches_current_boot(
+    previous: &PersistedClockState,
+    current_boot_epoch: Option<[u8; 16]>,
+) -> bool {
+    matches!(
+        (previous.boot_epoch, current_boot_epoch),
+        (Some(persisted), Some(current)) if persisted == current
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -222,10 +233,10 @@ impl PlatformTimeSampler {
         self.source
     }
 
-    /// Samples UTC only when the pinned platform source currently reports a
-    /// synchronized clock. Monotonic elapsed time remains available during a
-    /// source outage so the service can freeze or advance its durable
-    /// effective clock according to its own fail-closed policy.
+    /// Samples the host wall clock and a suspend-aware monotonic anchor. Bloom
+    /// never changes the host clock and does not depend on a separate time
+    /// daemon; Linux services apply the durable rollback and same-boot
+    /// discontinuity guard before using this value as authority time.
     pub fn sample(&self) -> Result<PlatformTimeReading, TrustedTimeError> {
         let (monotonic_anchor_ns, monotonic_elapsed_ms) = {
             let mut state = self
@@ -236,15 +247,11 @@ impl PlatformTimeSampler {
             let elapsed_ms = advance_sample_state(&mut state, anchor)?;
             (anchor, elapsed_ms)
         };
-        let utc_ms = if source_is_synchronized(self.source) {
-            let millis = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| TrustedTimeError::WallClockRange)?
-                .as_millis();
-            Some(u64::try_from(millis).map_err(|_| TrustedTimeError::WallClockRange)?)
-        } else {
-            None
-        };
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| TrustedTimeError::WallClockRange)?
+            .as_millis();
+        let utc_ms = Some(u64::try_from(millis).map_err(|_| TrustedTimeError::WallClockRange)?);
         Ok(PlatformTimeReading {
             utc_ms,
             monotonic_anchor_ns,
@@ -273,35 +280,6 @@ fn advance_sample_state(
         fractional_ns: elapsed_ns % 1_000_000,
     });
     Ok(elapsed_ns / 1_000_000)
-}
-
-#[cfg(target_os = "linux")]
-fn source_is_synchronized(source: TrustedTimeSource) -> bool {
-    if source != TrustedTimeSource::LinuxChronyNts {
-        return false;
-    }
-    // SAFETY: `adjtimex` initializes the provided plain C timex structure and
-    // does not retain the pointer. A zeroed timex performs a read-only query
-    // because `modes` is zero.
-    let mut status: libc::timex = unsafe { std::mem::zeroed() };
-    // SAFETY: status points to a valid writable timex for the duration of the
-    // syscall.
-    let result = unsafe { libc::adjtimex(&mut status) };
-    result >= 0 && result != libc::TIME_ERROR && status.status & libc::STA_UNSYNC == 0
-}
-
-#[cfg(target_os = "macos")]
-fn source_is_synchronized(source: TrustedTimeSource) -> bool {
-    // macOS does not expose `timed` trust through the kernel NTP discipline.
-    // The host wall clock is therefore authoritative for this profile; an
-    // administrator able to change it is already outside Bloom's service
-    // isolation boundary.
-    source == TrustedTimeSource::MacosManagedTimed
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn source_is_synchronized(_source: TrustedTimeSource) -> bool {
-    false
 }
 
 #[cfg(target_os = "linux")]
@@ -371,7 +349,7 @@ mod tests {
     #[test]
     fn source_id_round_trips() {
         #[cfg(target_os = "linux")]
-        let expected = TrustedTimeSource::LinuxChronyNts;
+        let expected = TrustedTimeSource::LinuxSystemClock;
         #[cfg(target_os = "macos")]
         let expected = TrustedTimeSource::MacosManagedTimed;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -389,19 +367,19 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert!(TrustedTimeSource::for_current_platform("macos-managed-timed").is_err());
         #[cfg(target_os = "macos")]
-        assert!(TrustedTimeSource::for_current_platform("linux-chrony-nts").is_err());
+        assert!(TrustedTimeSource::for_current_platform("linux-system-clock").is_err());
     }
 
     #[test]
-    fn only_authenticated_linux_time_uses_the_durable_guard() {
-        assert!(TrustedTimeSource::LinuxChronyNts.requires_durable_clock_guard());
+    fn linux_system_time_uses_the_durable_guard() {
+        assert!(TrustedTimeSource::LinuxSystemClock.requires_durable_clock_guard());
         assert!(!TrustedTimeSource::MacosManagedTimed.requires_durable_clock_guard());
     }
 
     #[test]
     fn samples_never_invent_a_peer_or_fallback_timestamp() {
         #[cfg(target_os = "linux")]
-        let source = "linux-chrony-nts";
+        let source = "linux-system-clock";
         #[cfg(target_os = "macos")]
         let source = "macos-managed-timed";
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -409,15 +387,13 @@ mod tests {
 
         let reading = PlatformTimeSampler::new(source).unwrap().sample().unwrap();
         assert!(reading.monotonic_anchor_ns > 0);
-        if let Some(utc_ms) = reading.utc_ms {
-            assert!(utc_ms > 0);
-        }
+        assert!(reading.utc_ms.is_some_and(|utc_ms| utc_ms > 0));
     }
 
     #[test]
     fn absolute_suspend_aware_anchor_is_monotonic_across_concurrent_samples() {
         #[cfg(target_os = "linux")]
-        let source = "linux-chrony-nts";
+        let source = "linux-system-clock";
         #[cfg(target_os = "macos")]
         let source = "macos-managed-timed";
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -567,14 +543,11 @@ mod tests {
     }
 
     #[test]
-    fn durable_clock_rejects_a_larger_anchor_from_a_different_boot() {
-        // A reboot restarts CLOCK_BOOTTIME at zero, so a current anchor can
-        // exceed a persisted one while belonging to a different boot: a short
-        // prior boot followed by a longer current one. The subtraction then
-        // looks valid and would credit downtime that never elapsed, inflating
-        // the effective now and letting a large UTC step pass the forward-step
-        // guard. Only the domain identifier distinguishes this from real
-        // continuity; a rollback check cannot, because nothing rolled back.
+    fn durable_clock_accepts_non_decreasing_wall_time_after_reboot() {
+        // A reboot restarts CLOCK_BOOTTIME at zero. Its new anchor cannot prove
+        // how long the machine was powered off, so the durable floor rejects
+        // rollback while a nondecreasing host clock re-establishes current
+        // time without requiring a separate synchronization daemon.
         let two_hours_ms = 2 * 60 * 60 * 1_000;
         let previous = PersistedClockState {
             last_effective_ms: 10_000,
@@ -593,13 +566,13 @@ mod tests {
             evaluate_durable_clock(Some(previous), &reading, Some(EPOCH_B), MAX_FORWARD_STEP_MS)
                 .unwrap(),
             DurableClockDecision {
-                effective_now_ms: 10_000,
-                condition: DurableClockCondition::ForwardJumpRejected,
+                effective_now_ms: 10_000 + two_hours_ms,
+                condition: DurableClockCondition::Healthy,
             },
-            "a larger anchor from another boot must not be credited"
+            "a nondecreasing wall clock must recover normally after reboot"
         );
 
-        // An unknown domain on either side is not evidence of continuity.
+        // Unknown domains also cannot apply a same-boot forward-step ceiling.
         for (persisted, current) in [(None, Some(EPOCH_A)), (Some(EPOCH_A), None), (None, None)] {
             let decision = evaluate_durable_clock(
                 Some(PersistedClockState {
@@ -613,18 +586,29 @@ mod tests {
             .unwrap();
             assert_eq!(
                 decision.condition,
-                DurableClockCondition::ForwardJumpRejected,
-                "unknown domain must fall back to process-relative elapsed"
+                DurableClockCondition::Healthy,
+                "unknown domain must not freeze ordinary reboot downtime"
             );
         }
 
-        // The same anchors within one domain are real downtime, still credited.
+        // Within one confirmed boot, a small monotonic advance still exposes
+        // and rejects a large wall-clock discontinuity.
+        let jump_reading = PlatformTimeReading {
+            monotonic_anchor_ns: previous.monotonic_anchor_ns + 1_000_000_000,
+            monotonic_elapsed_ms: 0,
+            ..reading
+        };
         assert_eq!(
-            evaluate_durable_clock(Some(previous), &reading, Some(EPOCH_A), MAX_FORWARD_STEP_MS)
-                .unwrap()
-                .condition,
-            DurableClockCondition::Healthy,
-            "matching domains must still credit absolute downtime"
+            evaluate_durable_clock(
+                Some(previous),
+                &jump_reading,
+                Some(EPOCH_A),
+                MAX_FORWARD_STEP_MS,
+            )
+            .unwrap()
+            .condition,
+            DurableClockCondition::ForwardJumpRejected,
+            "matching domains must retain the forward-step guard"
         );
     }
 

@@ -1593,7 +1593,7 @@ mod tests {
                 "trusted_time_source": if cfg!(target_os = "macos") {
                     "macos-managed-timed"
                 } else {
-                    "linux-chrony-nts"
+                    "linux-system-clock"
                 },
                 "machine": peer("bloom-machine", "machine-app"),
                 "broker": peer("bloom-broker", "broker-app"),
