@@ -92,7 +92,21 @@ pub struct CheckpointStore {
     #[cfg(test)]
     scan_count: AtomicU64,
     #[cfg(test)]
+    census_metadata_count: AtomicU64,
+    #[cfg(test)]
+    existing_link_reconcile_count: AtomicU64,
+    #[cfg(test)]
+    skip_directory_lock: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     publish_barrier: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    post_publish_hook: Mutex<Option<std::sync::Arc<PostPublishHook>>>,
+}
+
+#[cfg(test)]
+struct PostPublishHook {
+    published: std::sync::Barrier,
+    resume: std::sync::Barrier,
 }
 
 struct PeerKeySet {
@@ -258,7 +272,15 @@ impl CheckpointStore {
             #[cfg(test)]
             scan_count: AtomicU64::new(0),
             #[cfg(test)]
+            census_metadata_count: AtomicU64::new(0),
+            #[cfg(test)]
+            existing_link_reconcile_count: AtomicU64::new(0),
+            #[cfg(test)]
+            skip_directory_lock: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             publish_barrier: Mutex::new(None),
+            #[cfg(test)]
+            post_publish_hook: Mutex::new(None),
         };
         let scanned = store.scan_records()?;
         store.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
@@ -270,12 +292,6 @@ impl CheckpointStore {
             .operation
             .lock()
             .map_err(|_| CheckpointError::Malformed("checkpoint operation lock poisoned".into()))?;
-        #[cfg(test)]
-        let publish_barrier = self.publish_barrier.lock().unwrap().clone();
-        #[cfg(test)]
-        if let Some(barrier) = publish_barrier {
-            barrier.wait();
-        }
         let _directory = self.lock_directory(rustix::fs::FlockOperation::LockExclusive)?;
         self.verify_live_head(peer_head)?;
         if self.cached_head_is_exact(peer_head)? {
@@ -342,11 +358,20 @@ impl CheckpointStore {
             return Err(error.into());
         }
         drop(file);
+        #[cfg(test)]
+        let publish_barrier = self.publish_barrier.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(barrier) = publish_barrier {
+            barrier.wait();
+        }
         let linked = fs::hard_link(&temporary, &path);
         let _ = fs::remove_file(&temporary);
         match linked {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                #[cfg(test)]
+                self.existing_link_reconcile_count
+                    .fetch_add(1, Ordering::Relaxed);
                 let outcome = self.validate_exact_existing(&path, &bytes, peer_head)?;
                 let scanned = self.scan_records()?;
                 self.replace_cached_state(
@@ -359,13 +384,27 @@ impl CheckpointStore {
             Err(error) => return Err(error.into()),
         }
         File::open(&self.root)?.sync_all()?;
-        let stamp = root_stamp(&self.root, self.expected_uid)?;
+        #[cfg(test)]
+        let post_publish_hook = self.post_publish_hook.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(hook) = post_publish_hook {
+            hook.published.wait();
+            hook.resume.wait();
+        }
         let record_stamp = record_stamp(&path)?;
+        let mut expected_stamps = self.lock_state()?.record_stamps.clone();
+        expected_stamps.insert(path.clone(), record_stamp);
+        if !self.record_stamps_unchanged(&expected_stamps)? {
+            let scanned = self.scan_records()?;
+            self.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
+            return Ok(AppendOutcome::Appended);
+        }
+        let stamp = root_stamp(&self.root, self.expected_uid)?;
         let mut state = self.lock_state()?;
         state
             .latest
             .insert(peer_head.service_id.clone(), peer_head.clone());
-        state.record_stamps.insert(path, record_stamp);
+        state.record_stamps = expected_stamps;
         state.root_stamp = stamp;
         Ok(AppendOutcome::Appended)
     }
@@ -503,12 +542,26 @@ impl CheckpointStore {
         &self,
         expected: &BTreeMap<PathBuf, RecordStamp>,
     ) -> Result<bool, CheckpointError> {
-        for (path, expected_stamp) in expected {
-            if record_stamp(path)? != *expected_stamp {
+        let mut observed_count = 0;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(expected_stamp) = expected.get(&path) else {
+                return Ok(false);
+            };
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            #[cfg(test)]
+            self.census_metadata_count.fetch_add(1, Ordering::Relaxed);
+            if record_stamp_from_metadata(&metadata) != *expected_stamp {
                 return Ok(false);
             }
+            observed_count += 1;
         }
-        Ok(true)
+        Ok(observed_count == expected.len())
     }
 
     fn validate_cached_record(&self, head: &SignedJournalHead) -> Result<(), CheckpointError> {
@@ -559,10 +612,14 @@ impl CheckpointStore {
     fn lock_directory(
         &self,
         operation: rustix::fs::FlockOperation,
-    ) -> Result<DirectoryLock<'_>, CheckpointError> {
+    ) -> Result<Option<DirectoryLock<'_>>, CheckpointError> {
+        #[cfg(test)]
+        if self.skip_directory_lock.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         rustix::fs::flock(&self.root_lock, operation)
             .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
-        Ok(DirectoryLock(&self.root_lock))
+        Ok(Some(DirectoryLock(&self.root_lock)))
     }
 
     fn verify_live_head(&self, head: &SignedJournalHead) -> Result<(), CheckpointError> {
@@ -1072,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_authenticated_head_has_bounded_disk_work() {
+    fn unchanged_authenticated_head_avoids_full_reconciliation() {
         let directory = tempfile::tempdir().unwrap();
         let store = open_store(&directory);
         let mut expected = head(7, "11");
@@ -1084,6 +1141,8 @@ mod tests {
         }
         let scans_after_publication = store.scan_count.load(Ordering::Relaxed);
         assert_eq!(scans_after_publication, 1);
+        let retained_records = fs::read_dir(directory.path()).unwrap().count() as u64;
+        let census_metadata_before = store.census_metadata_count.load(Ordering::Relaxed);
 
         for _ in 0..1_000 {
             assert_eq!(
@@ -1097,7 +1156,12 @@ mod tests {
             scans_after_publication,
             "an unchanged peer head must not rescan retained history"
         );
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 33);
+        assert_eq!(retained_records, 33);
+        assert_eq!(
+            store.census_metadata_count.load(Ordering::Relaxed) - census_metadata_before,
+            1_000 * retained_records,
+            "each fast-path admission must census every retained record exactly once"
+        );
     }
 
     #[test]
@@ -1155,6 +1219,7 @@ mod tests {
         ];
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         for store in &stores {
+            store.skip_directory_lock.store(true, Ordering::Relaxed);
             *store.publish_barrier.lock().unwrap() = Some(std::sync::Arc::clone(&barrier));
         }
         let expected = head(12, "66");
@@ -1179,6 +1244,14 @@ mod tests {
             outcomes,
             vec![AppendOutcome::Appended, AppendOutcome::AlreadyPresent]
         );
+        let existing_link_reconciliations = stores
+            .iter()
+            .map(|store| store.existing_link_reconcile_count.load(Ordering::Relaxed))
+            .sum::<u64>();
+        assert_eq!(
+            existing_link_reconciliations, 1,
+            "the hard-link loser must execute the full reconciliation branch"
+        );
         let expected_suffix = checkpoint_filename(&expected);
         assert!(
             fs::read_dir(directory.path().parent().unwrap())
@@ -1195,6 +1268,57 @@ mod tests {
         assert_eq!(
             reopened.append(&expected).unwrap(),
             AppendOutcome::AlreadyPresent
+        );
+    }
+
+    #[test]
+    fn append_reconciles_a_foreign_record_published_before_cache_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(open_store(&directory));
+        assert_eq!(
+            store.append(&head(1, "11")).unwrap(),
+            AppendOutcome::Appended
+        );
+        let hook = std::sync::Arc::new(PostPublishHook {
+            published: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        });
+        *store.post_publish_hook.lock().unwrap() = Some(std::sync::Arc::clone(&hook));
+
+        let worker_store = std::sync::Arc::clone(&store);
+        let worker = std::thread::spawn(move || worker_store.append(&head(2, "22")));
+        hook.published.wait();
+
+        let foreign_head = head(3, "33");
+        let foreign_record = CheckpointRecord {
+            schema: Token::new(CHECKPOINT_SCHEMA).unwrap(),
+            recipient_service_id: Token::new("bloom-broker").unwrap(),
+            peer_head: foreign_head.clone(),
+        };
+        let foreign_path = directory.path().join(checkpoint_filename(&foreign_head));
+        let mut foreign_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&foreign_path)
+            .unwrap();
+        foreign_file
+            .write_all(&serde_jcs::to_vec(&foreign_record).unwrap())
+            .unwrap();
+        foreign_file.sync_all().unwrap();
+        drop(foreign_file);
+        File::open(directory.path()).unwrap().sync_all().unwrap();
+
+        hook.resume.wait();
+        assert_eq!(worker.join().unwrap().unwrap(), AppendOutcome::Appended);
+        assert_eq!(
+            store
+                .latest(&foreign_head.service_id)
+                .unwrap()
+                .unwrap()
+                .sequence
+                .get(),
+            3
         );
     }
 
