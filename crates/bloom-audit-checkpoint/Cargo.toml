@@ -9,6 +9,7 @@ license.workspace = true
 bloom-rpc-wire.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true
 serde_json.workspace = true

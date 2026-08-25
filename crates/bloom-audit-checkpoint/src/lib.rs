@@ -82,6 +82,7 @@ pub trait CheckpointSink: Send + Sync {
 
 pub struct CheckpointStore {
     root: PathBuf,
+    root_lock: File,
     expected_uid: u32,
     recipient_service_id: Token,
     peer_keys: BTreeMap<Token, PeerKeySet>,
@@ -121,6 +122,14 @@ struct ScannedRecords {
     records: Vec<CheckpointRecord>,
     root_stamp: RootStamp,
     record_stamps: BTreeMap<PathBuf, RecordStamp>,
+}
+
+struct DirectoryLock<'a>(&'a File);
+
+impl Drop for DirectoryLock<'_> {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(self.0, rustix::fs::FlockOperation::Unlock);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,8 +241,10 @@ impl CheckpointStore {
             }
         }
         let initial_root_stamp = root_stamp(&root, expected_uid)?;
+        let root_lock = File::open(&root)?;
         let store = Self {
             root,
+            root_lock,
             expected_uid,
             recipient_service_id,
             peer_keys,
@@ -259,39 +270,46 @@ impl CheckpointStore {
             .operation
             .lock()
             .map_err(|_| CheckpointError::Malformed("checkpoint operation lock poisoned".into()))?;
+        #[cfg(test)]
+        let publish_barrier = self.publish_barrier.lock().unwrap().clone();
+        #[cfg(test)]
+        if let Some(barrier) = publish_barrier {
+            barrier.wait();
+        }
+        let _directory = self.lock_directory(rustix::fs::FlockOperation::LockExclusive)?;
         self.verify_live_head(peer_head)?;
         if self.cached_head_is_exact(peer_head)? {
             return Ok(AppendOutcome::AlreadyPresent);
         }
 
-        // Advancing, conflicting, or rolled-back heads retain the original
-        // fail-closed behavior: reconcile the complete on-disk chain before
-        // making a decision. Only an exact, already-verified tail is eligible
-        // for the constant-time fast path above.
-        let scanned = self.scan_records()?;
-        self.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
-        let records = scanned.records;
-        let latest = records
-            .iter()
-            .rev()
-            .find(|record| record.peer_head.service_id == peer_head.service_id);
+        // Startup establishes the verified history. If the directory and all
+        // immutable record identities still match that snapshot, extend its
+        // verified tail without reparsing and reverifying every signature.
+        let stamp = root_stamp(&self.root, self.expected_uid)?;
+        let cache_is_current = {
+            let state = self.lock_state()?;
+            state.root_stamp == stamp && self.record_stamps_unchanged(&state.record_stamps)?
+        };
+        if !cache_is_current {
+            let scanned = self.scan_records()?;
+            self.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
+        }
+        let latest = self
+            .lock_state()?
+            .latest
+            .get(&peer_head.service_id)
+            .cloned();
         if let Some(latest) = latest {
-            if latest.peer_head.key_id != peer_head.key_id
-                && !self.valid_handover(&latest.peer_head, peer_head)
-            {
+            if latest.key_id != peer_head.key_id && !self.valid_handover(&latest, peer_head) {
                 return Err(CheckpointError::SequenceConflict);
             }
-            match peer_head
-                .sequence
-                .get()
-                .cmp(&latest.peer_head.sequence.get())
-            {
+            match peer_head.sequence.get().cmp(&latest.sequence.get()) {
                 std::cmp::Ordering::Less => return Err(CheckpointError::SequenceRollback),
-                std::cmp::Ordering::Equal if &latest.peer_head == peer_head => {
+                std::cmp::Ordering::Equal if &latest == peer_head => {
                     return Ok(AppendOutcome::AlreadyPresent);
                 }
                 std::cmp::Ordering::Equal
-                    if self.valid_equal_sequence_handover(&latest.peer_head, peer_head) => {}
+                    if self.valid_equal_sequence_handover(&latest, peer_head) => {}
                 std::cmp::Ordering::Equal => return Err(CheckpointError::SequenceConflict),
                 std::cmp::Ordering::Greater => {}
             }
@@ -324,21 +342,12 @@ impl CheckpointStore {
             return Err(error.into());
         }
         drop(file);
-        #[cfg(test)]
-        let publish_barrier = self.publish_barrier.lock().unwrap().clone();
-        #[cfg(test)]
-        if let Some(barrier) = publish_barrier {
-            barrier.wait();
-        }
         let linked = fs::hard_link(&temporary, &path);
         let _ = fs::remove_file(&temporary);
         match linked {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let outcome = self.validate_exact_existing(&path, &bytes, peer_head)?;
-                // Reconcile after a competing publisher so a concurrent
-                // higher sequence or malformed sibling cannot be hidden by
-                // the idempotent target record.
                 let scanned = self.scan_records()?;
                 self.replace_cached_state(
                     &scanned.records,
@@ -350,11 +359,14 @@ impl CheckpointStore {
             Err(error) => return Err(error.into()),
         }
         File::open(&self.root)?.sync_all()?;
-        // A second store can publish a higher head between our preflight scan
-        // and link. Reconcile after every new publication before caching so an
-        // inter-process conflict or rollback is never masked by local state.
-        let scanned = self.scan_records()?;
-        self.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
+        let stamp = root_stamp(&self.root, self.expected_uid)?;
+        let record_stamp = record_stamp(&path)?;
+        let mut state = self.lock_state()?;
+        state
+            .latest
+            .insert(peer_head.service_id.clone(), peer_head.clone());
+        state.record_stamps.insert(path, record_stamp);
+        state.root_stamp = stamp;
         Ok(AppendOutcome::Appended)
     }
 
@@ -363,6 +375,7 @@ impl CheckpointStore {
             .operation
             .lock()
             .map_err(|_| CheckpointError::Malformed("checkpoint operation lock poisoned".into()))?;
+        let _directory = self.lock_directory(rustix::fs::FlockOperation::LockShared)?;
         let stamp = root_stamp(&self.root, self.expected_uid)?;
         let cached = {
             let state = self.lock_state()?;
@@ -541,6 +554,15 @@ impl CheckpointStore {
         self.state
             .lock()
             .map_err(|_| CheckpointError::Malformed("checkpoint cache lock poisoned".into()))
+    }
+
+    fn lock_directory(
+        &self,
+        operation: rustix::fs::FlockOperation,
+    ) -> Result<DirectoryLock<'_>, CheckpointError> {
+        rustix::fs::flock(&self.root_lock, operation)
+            .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+        Ok(DirectoryLock(&self.root_lock))
     }
 
     fn verify_live_head(&self, head: &SignedJournalHead) -> Result<(), CheckpointError> {
@@ -1061,7 +1083,7 @@ mod tests {
             assert_eq!(store.append(&expected).unwrap(), AppendOutcome::Appended);
         }
         let scans_after_publication = store.scan_count.load(Ordering::Relaxed);
-        assert_eq!(scans_after_publication, 67);
+        assert_eq!(scans_after_publication, 1);
 
         for _ in 0..1_000 {
             assert_eq!(
