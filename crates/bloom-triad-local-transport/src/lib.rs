@@ -315,18 +315,45 @@ fn require_developer_root(path: &Path, uid: u32) -> Result<std::path::PathBuf, P
     }
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| unauthenticated(&format!("inspect {}: {error}", path.display())))?;
+    require_developer_root_shape(&metadata, uid)?;
+    // Re-check the resolved path, not just the name that was passed in. The
+    // name could be swapped between the two inspections, and the identity and
+    // manifest are read through the canonical path, so that is the object
+    // whose ownership and mode have to hold.
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| unauthenticated(&format!("canonicalize developer root: {error}")))?;
+    let canonical_metadata = fs::symlink_metadata(&canonical)
+        .map_err(|error| unauthenticated(&format!("inspect {}: {error}", canonical.display())))?;
+    require_developer_root_shape(&canonical_metadata, uid)?;
+    if canonical_metadata.dev() != metadata.dev() || canonical_metadata.ino() != metadata.ino() {
+        return Err(unauthenticated(
+            "developer transport root changed identity while it was being validated",
+        ));
+    }
+    Ok(canonical)
+}
+
+/// The properties a developer transport root must have.
+///
+/// Deliberately not a link-count check. An earlier version also required
+/// `nlink >= 2`, taking the traditional `.` plus parent-entry count as
+/// evidence of a real, linked directory. That is a filesystem-specific
+/// assumption: btrfs reports `nlink == 1` for every directory, so the check
+/// refused every root on such a host while proving nothing extra elsewhere.
+/// `is_dir()` already establishes the type, and `symlink_metadata` succeeding
+/// establishes that the name resolves; the caller additionally confirms the
+/// canonical path is the same object.
+fn require_developer_root_shape(metadata: &fs::Metadata, uid: u32) -> Result<(), ProtocolError> {
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != uid
         || metadata.mode() & 0o7777 != 0o700
-        || metadata.nlink() < 2
     {
         return Err(unauthenticated(
             "developer transport root must be a current-UID-owned mode-0700 non-symlink directory",
         ));
     }
-    fs::canonicalize(path)
-        .map_err(|error| unauthenticated(&format!("canonicalize developer root: {error}")))
+    Ok(())
 }
 
 #[cfg(feature = "triad-dev-harness")]
@@ -1306,6 +1333,98 @@ mod tests {
     #[cfg(feature = "triad-dev-harness")]
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ----------------------------------------------------------------
+    // Developer transport root validation.
+    //
+    // These must hold on every filesystem the harness runs on. The check
+    // previously required `nlink >= 2`, which is a traditional-Unix directory
+    // convention rather than a portable guarantee: btrfs reports `nlink == 1`
+    // for every directory, so a correct root was refused outright there.
+    // ----------------------------------------------------------------
+
+    #[cfg(feature = "triad-dev-harness")]
+    fn developer_root_dir(parent: &std::path::Path, name: &str, mode: u32) -> std::path::PathBuf {
+        let path = parent.join(name);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_root_accepts_a_correct_directory_on_any_filesystem() {
+        let uid = rustix::process::geteuid().as_raw();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = developer_root_dir(temporary.path(), "root", 0o700);
+
+        let observed_nlink = std::fs::symlink_metadata(&root).unwrap().nlink();
+        let resolved = super::require_developer_root(&root, uid)
+            .expect("a current-UID-owned mode-0700 directory must be accepted");
+        assert_eq!(resolved, std::fs::canonicalize(&root).unwrap());
+        // The point of the change: acceptance must not depend on the link
+        // count, whatever this filesystem reports it as.
+        assert!(
+            observed_nlink >= 1,
+            "sanity: a live directory has at least one link"
+        );
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_root_still_refuses_every_unsafe_shape() {
+        let uid = rustix::process::geteuid().as_raw();
+        let temporary = tempfile::tempdir().unwrap();
+
+        // Relative path.
+        assert!(super::require_developer_root(std::path::Path::new("relative/root"), uid).is_err());
+
+        // Root refuses outright, regardless of the path.
+        let ok_root = developer_root_dir(temporary.path(), "for-root", 0o700);
+        assert!(super::require_developer_root(&ok_root, 0).is_err());
+
+        // Group- or world-accessible modes.
+        for (name, mode) in [("g", 0o750), ("o", 0o707), ("wide", 0o777)] {
+            let path = developer_root_dir(temporary.path(), name, mode);
+            let error = super::require_developer_root(&path, uid)
+                .expect_err("a non-0700 root must be refused");
+            assert!(error.message.contains("mode-0700"), "{}", error.message);
+        }
+
+        // A regular file is not a directory.
+        let file = temporary.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, Permissions::from_mode(0o700)).unwrap();
+        assert!(super::require_developer_root(&file, uid).is_err());
+
+        // A symlink to a valid root is still a symlink at the named path.
+        let target = developer_root_dir(temporary.path(), "target", 0o700);
+        let link = temporary.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error = super::require_developer_root(&link, uid)
+            .expect_err("a symlinked root must be refused");
+        assert!(error.message.contains("non-symlink"), "{}", error.message);
+
+        // Missing path.
+        assert!(super::require_developer_root(&temporary.path().join("absent"), uid).is_err());
+    }
+
+    #[cfg(feature = "triad-dev-harness")]
+    #[test]
+    fn developer_root_rejects_a_uid_other_than_the_caller() {
+        let uid = rustix::process::geteuid().as_raw();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = developer_root_dir(temporary.path(), "root", 0o700);
+        // The directory is owned by the current UID, so validating it as some
+        // other UID must fail on the ownership check.
+        let error = super::require_developer_root(&root, uid.wrapping_add(1))
+            .expect_err("a root owned by another UID must be refused");
+        assert!(
+            error.message.contains("current-UID-owned"),
+            "{}",
+            error.message
+        );
+    }
 
     const TEST_CURRENT: ProtocolVersion = ProtocolVersion::new(1, 1);
     const TEST_RANGE: ProtocolVersionRange = ProtocolVersionRange::new(1, 1, 1);
