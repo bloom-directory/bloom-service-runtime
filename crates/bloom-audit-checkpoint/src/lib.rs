@@ -392,6 +392,10 @@ impl CheckpointStore {
             .map_err(|_| CheckpointError::Malformed("checkpoint operation lock poisoned".into()))?;
         let _directory = self.lock_directory(rustix::fs::FlockOperation::LockShared)?;
         let stamp = root_stamp(&self.root, self.expected_uid)?;
+        // This bounded cache trust assumes every live writer holds the
+        // directory lock and every namespace addition advances the root
+        // mtime/ctime. A writer that bypasses that contract is reconciled on
+        // restart; do not extend this path to uncooperative live writers.
         let cached = {
             let state = self.lock_state()?;
             (state.root_stamp == stamp).then(|| state.latest.get(service_id).cloned())
@@ -1049,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_head_fast_path_rejects_tail_tamper_and_directory_conflicts() {
+    fn unchanged_head_fast_path_rejects_tail_tamper_and_namespace_changes() {
         let directory = tempfile::tempdir().unwrap();
         let store = open_store(&directory);
         let expected = head(7, "11");
@@ -1071,25 +1075,38 @@ mod tests {
             peer_head: expected.clone(),
         };
         fs::write(&path, serde_jcs::to_vec(&record).unwrap()).unwrap();
-        let latest = head(8, "22");
-        store.append(&latest).unwrap();
-        let mut historical_bytes = fs::read(&path).unwrap();
-        *historical_bytes.last_mut().unwrap() ^= 1;
-        fs::write(&path, historical_bytes).unwrap();
-        assert_eq!(
-            store.append(&latest).unwrap(),
-            AppendOutcome::AlreadyPresent,
-            "the bounded fast path validates the current tail, not every historical inode"
-        );
-
-        // A namespace change invalidates the root stamp and forces full
-        // fail-closed reconciliation, which observes historical tamper.
         let target = directory.path().join("outside");
         fs::write(&target, b"{}").unwrap();
         let link = directory.path().join("unsafe.jcs");
         symlink(&target, &link).unwrap();
         assert!(matches!(
             store.append(&expected),
+            Err(CheckpointError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn unchanged_head_fast_path_does_not_detect_historical_in_place_tamper() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(&directory);
+        let historical = head(7, "11");
+        store.append(&historical).unwrap();
+        let latest = head(8, "22");
+        store.append(&latest).unwrap();
+
+        let historical_path = directory.path().join(checkpoint_filename(&historical));
+        let mut historical_bytes = fs::read(&historical_path).unwrap();
+        *historical_bytes.last_mut().unwrap() ^= 1;
+        fs::write(&historical_path, historical_bytes).unwrap();
+        assert_eq!(
+            store.append(&latest).unwrap(),
+            AppendOutcome::AlreadyPresent,
+            "the bounded fast path validates the current tail, not every historical inode"
+        );
+
+        drop(store);
+        assert!(matches!(
+            open_store_result(&directory),
             Err(CheckpointError::Malformed(_))
         ));
     }
