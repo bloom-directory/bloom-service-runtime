@@ -18,7 +18,10 @@ impl TrustedTimeSource {
     pub fn for_current_platform(source_id: &str) -> Result<Self, TrustedTimeError> {
         match source_id {
             #[cfg(target_os = "linux")]
-            "linux-system-clock" => Ok(Self::LinuxSystemClock),
+            // `linux-chrony-nts` was written into deployed schema-1 edge
+            // manifests. Keep it as a decode-only compatibility alias while
+            // new manifests converge on `linux-system-clock` via `source_id`.
+            "linux-system-clock" | "linux-chrony-nts" => Ok(Self::LinuxSystemClock),
             #[cfg(target_os = "macos")]
             "macos-managed-timed" => Ok(Self::MacosManagedTimed),
             _ => Err(TrustedTimeError::SourceMismatch(source_id.to_owned())),
@@ -129,7 +132,7 @@ pub fn evaluate_durable_clock(
         });
     }
 
-    let same_boot = persisted_anchor_matches_current_boot(&previous, current_boot_epoch);
+    let confirmed_reboot = persisted_anchor_is_from_different_boot(&previous, current_boot_epoch);
     let monotonic_now = previous
         .last_effective_ms
         .checked_add(elapsed_since_persisted_anchor(
@@ -144,7 +147,10 @@ pub fn evaluate_durable_clock(
             condition: DurableClockCondition::RollbackFrozen,
         });
     }
-    if same_boot && utc_ms > monotonic_now.saturating_add(max_forward_step_ms) {
+    // Only two present, unequal epochs prove that CLOCK_BOOTTIME restarted.
+    // Unknown epochs include legacy persisted state and must not silently turn
+    // a same-boot wall-clock attack into a healthy observation.
+    if !confirmed_reboot && utc_ms > monotonic_now.saturating_add(max_forward_step_ms) {
         return Ok(DurableClockDecision {
             effective_now_ms: monotonic_now,
             condition: DurableClockCondition::ForwardJumpRejected,
@@ -170,9 +176,9 @@ pub fn evaluate_durable_clock(
 /// The domain identifier decides whether the persisted anchor can contribute
 /// elapsed time. Anything other than a confirmed match — a different domain,
 /// or an unknown one on either side — falls back to process-relative elapsed
-/// time. The caller separately limits forward jumps only within a confirmed
-/// boot; across reboot, rejecting elapsed wall time would make ordinary
-/// powered-off intervals indistinguishable from attacks and freeze the clock.
+/// time. The caller waives the forward-step ceiling only for a *confirmed*
+/// reboot. Unknown domains remain fail-closed; treating missing legacy state
+/// as proof of a reboot would create a one-time unguarded forward-jump window.
 fn elapsed_since_persisted_anchor(
     previous: &PersistedClockState,
     current_boot_epoch: Option<[u8; 16]>,
@@ -197,6 +203,16 @@ fn persisted_anchor_matches_current_boot(
     matches!(
         (previous.boot_epoch, current_boot_epoch),
         (Some(persisted), Some(current)) if persisted == current
+    )
+}
+
+fn persisted_anchor_is_from_different_boot(
+    previous: &PersistedClockState,
+    current_boot_epoch: Option<[u8; 16]>,
+) -> bool {
+    matches!(
+        (previous.boot_epoch, current_boot_epoch),
+        (Some(persisted), Some(current)) if persisted != current
     )
 }
 
@@ -358,6 +374,21 @@ mod tests {
         assert_eq!(
             TrustedTimeSource::for_current_platform(expected.source_id()).unwrap(),
             expected
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deployed_linux_source_id_remains_a_decode_only_alias() {
+        assert_eq!(
+            TrustedTimeSource::for_current_platform("linux-chrony-nts").unwrap(),
+            TrustedTimeSource::LinuxSystemClock
+        );
+        assert_eq!(
+            TrustedTimeSource::for_current_platform("linux-chrony-nts")
+                .unwrap()
+                .source_id(),
+            "linux-system-clock"
         );
     }
 
@@ -572,7 +603,9 @@ mod tests {
             "a nondecreasing wall clock must recover normally after reboot"
         );
 
-        // Unknown domains also cannot apply a same-boot forward-step ceiling.
+        // An unknown domain is not evidence that a reboot occurred. This is
+        // the legacy-upgrade path, and it must retain the process-relative
+        // ceiling until an operator establishes trusted state.
         for (persisted, current) in [(None, Some(EPOCH_A)), (Some(EPOCH_A), None), (None, None)] {
             let decision = evaluate_durable_clock(
                 Some(PersistedClockState {
@@ -585,9 +618,12 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                decision.condition,
-                DurableClockCondition::Healthy,
-                "unknown domain must not freeze ordinary reboot downtime"
+                decision,
+                DurableClockDecision {
+                    effective_now_ms: previous.last_effective_ms,
+                    condition: DurableClockCondition::ForwardJumpRejected,
+                },
+                "unknown domain must not waive the forward-step ceiling"
             );
         }
 

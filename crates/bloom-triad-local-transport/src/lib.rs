@@ -1610,6 +1610,26 @@ mod tests {
         (directory, identity_path, manifest_path)
     }
 
+    #[cfg(all(feature = "triad-dev-harness", target_os = "linux"))]
+    #[test]
+    fn deployed_schema_one_linux_manifest_id_remains_compatible() {
+        let (directory, identity_path, manifest_path) = developer_files();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["trusted_time_source"] = serde_json::json!("linux-chrony-nts");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let loaded = load_developer_identity_and_manifest(
+            &root,
+            &identity_path,
+            &manifest_path,
+            "bloom-machine",
+        )
+        .unwrap();
+        assert_eq!(loaded.1.trusted_time_source, "linux-chrony-nts");
+    }
+
     #[cfg(feature = "triad-dev-harness")]
     #[test]
     fn developer_loader_is_separate_strict_and_root_refusing() {
