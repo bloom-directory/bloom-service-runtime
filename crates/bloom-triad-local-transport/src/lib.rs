@@ -1593,7 +1593,7 @@ mod tests {
                 "trusted_time_source": if cfg!(target_os = "macos") {
                     "macos-managed-timed"
                 } else {
-                    "linux-system-clock"
+                    "linux-chrony-nts"
                 },
                 "machine": peer("bloom-machine", "machine-app"),
                 "broker": peer("bloom-broker", "broker-app"),
@@ -1612,11 +1612,11 @@ mod tests {
 
     #[cfg(all(feature = "triad-dev-harness", target_os = "linux"))]
     #[test]
-    fn deployed_schema_one_linux_manifest_id_remains_compatible() {
+    fn transitional_linux_system_clock_manifest_id_is_also_accepted() {
         let (directory, identity_path, manifest_path) = developer_files();
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        manifest["trusted_time_source"] = serde_json::json!("linux-chrony-nts");
+        manifest["trusted_time_source"] = serde_json::json!("linux-system-clock");
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
         let root = fs::canonicalize(directory.path()).unwrap();
@@ -1627,7 +1627,7 @@ mod tests {
             "bloom-machine",
         )
         .unwrap();
-        assert_eq!(loaded.1.trusted_time_source, "linux-chrony-nts");
+        assert_eq!(loaded.1.trusted_time_source, "linux-system-clock");
     }
 
     #[cfg(feature = "triad-dev-harness")]

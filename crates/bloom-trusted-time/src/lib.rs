@@ -18,9 +18,9 @@ impl TrustedTimeSource {
     pub fn for_current_platform(source_id: &str) -> Result<Self, TrustedTimeError> {
         match source_id {
             #[cfg(target_os = "linux")]
-            // `linux-chrony-nts` was written into deployed schema-1 edge
-            // manifests. Keep it as a decode-only compatibility alias while
-            // new manifests converge on `linux-system-clock` via `source_id`.
+            // Schema-1 manifests historically used `linux-chrony-nts`. Decode
+            // both spellings so draft/newer manifests remain usable, while
+            // `source_id` keeps emitting the rollback-compatible schema-1 ID.
             "linux-system-clock" | "linux-chrony-nts" => Ok(Self::LinuxSystemClock),
             #[cfg(target_os = "macos")]
             "macos-managed-timed" => Ok(Self::MacosManagedTimed),
@@ -30,7 +30,11 @@ impl TrustedTimeSource {
 
     pub const fn source_id(self) -> &'static str {
         match self {
-            Self::LinuxSystemClock => "linux-system-clock",
+            // This is a schema-1 wire identifier, not a statement that the
+            // implementation still requires Chrony. Changing it would make a
+            // regenerated manifest unreadable by older binaries during a
+            // mixed-version rollout or rollback.
+            Self::LinuxSystemClock => "linux-chrony-nts",
             Self::MacosManagedTimed => "macos-managed-timed",
         }
     }
@@ -379,7 +383,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn deployed_linux_source_id_remains_a_decode_only_alias() {
+    fn schema_one_linux_source_id_remains_rollback_compatible() {
         assert_eq!(
             TrustedTimeSource::for_current_platform("linux-chrony-nts").unwrap(),
             TrustedTimeSource::LinuxSystemClock
@@ -388,7 +392,11 @@ mod tests {
             TrustedTimeSource::for_current_platform("linux-chrony-nts")
                 .unwrap()
                 .source_id(),
-            "linux-system-clock"
+            "linux-chrony-nts"
+        );
+        assert_eq!(
+            TrustedTimeSource::for_current_platform("linux-system-clock").unwrap(),
+            TrustedTimeSource::LinuxSystemClock
         );
     }
 
