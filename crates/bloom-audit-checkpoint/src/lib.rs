@@ -109,12 +109,6 @@ enum Publication {
     AlreadyPresent,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RecordCensus {
-    unchanged: bool,
-    metadata_probes: usize,
-}
-
 struct PeerKeySet {
     current_key_id: Token,
     keys: BTreeMap<Token, VerifyingKey>,
@@ -135,13 +129,11 @@ struct RootStamp {
 struct CheckpointState {
     root_stamp: RootStamp,
     latest: BTreeMap<Token, SignedJournalHead>,
-    record_stamps: BTreeMap<PathBuf, RecordStamp>,
 }
 
 struct ScannedRecords {
     records: Vec<CheckpointRecord>,
     root_stamp: RootStamp,
-    record_stamps: BTreeMap<PathBuf, RecordStamp>,
 }
 
 struct DirectoryLock<'a>(&'a File);
@@ -150,20 +142,6 @@ impl Drop for DirectoryLock<'_> {
     fn drop(&mut self) {
         let _ = rustix::fs::flock(self.0, rustix::fs::FlockOperation::Unlock);
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RecordStamp {
-    device: u64,
-    inode: u64,
-    mode: u32,
-    uid: u32,
-    links: u64,
-    size: u64,
-    modified_secs: i64,
-    modified_nanos: i64,
-    changed_secs: i64,
-    changed_nanos: i64,
 }
 
 impl CheckpointStore {
@@ -273,11 +251,10 @@ impl CheckpointStore {
             state: Mutex::new(CheckpointState {
                 root_stamp: initial_root_stamp,
                 latest: BTreeMap::new(),
-                record_stamps: BTreeMap::new(),
             }),
         };
         let scanned = store.scan_records()?;
-        store.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
+        store.replace_cached_state(&scanned.records, scanned.root_stamp)?;
         Ok(store)
     }
 
@@ -292,17 +269,16 @@ impl CheckpointStore {
             return Ok(AppendOutcome::AlreadyPresent);
         }
 
-        // Startup establishes the verified history. If the directory and all
-        // immutable record identities still match that snapshot, extend its
-        // verified tail without reparsing and reverifying every signature.
+        // Startup establishes the verified history. A directory identity or
+        // namespace change forces full reconciliation; otherwise the cached
+        // verified tail is sufficient for this short-lived process cache.
+        // Historical in-place tamper is detected on restart or the next
+        // namespace change, while the exact current tail is validated below.
         let stamp = root_stamp(&self.root, self.expected_uid)?;
-        let cache_is_current = {
-            let state = self.lock_state()?;
-            state.root_stamp == stamp && self.record_census(&state.record_stamps)?.unchanged
-        };
+        let cache_is_current = self.lock_state()?.root_stamp == stamp;
         if !cache_is_current {
             let scanned = self.scan_records()?;
-            self.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
+            self.replace_cached_state(&scanned.records, scanned.root_stamp)?;
         }
         let latest = self
             .lock_state()?
@@ -395,25 +371,16 @@ impl CheckpointStore {
     ) -> Result<AppendOutcome, CheckpointError> {
         if publication == Publication::AlreadyPresent {
             let scanned = self.scan_records()?;
-            self.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
+            self.replace_cached_state(&scanned.records, scanned.root_stamp)?;
             return Ok(AppendOutcome::AlreadyPresent);
         }
 
         self.validate_exact_record(&prepared.path, &prepared.bytes, peer_head)?;
-        let record_stamp = record_stamp(&prepared.path)?;
-        let mut expected_stamps = self.lock_state()?.record_stamps.clone();
-        expected_stamps.insert(prepared.path.clone(), record_stamp);
-        if !self.record_census(&expected_stamps)?.unchanged {
-            let scanned = self.scan_records()?;
-            self.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
-            return Ok(AppendOutcome::Appended);
-        }
         let stamp = root_stamp(&self.root, self.expected_uid)?;
         let mut state = self.lock_state()?;
         state
             .latest
             .insert(peer_head.service_id.clone(), peer_head.clone());
-        state.record_stamps = expected_stamps;
         state.root_stamp = stamp;
         Ok(AppendOutcome::Appended)
     }
@@ -427,24 +394,17 @@ impl CheckpointStore {
         let stamp = root_stamp(&self.root, self.expected_uid)?;
         let cached = {
             let state = self.lock_state()?;
-            (state.root_stamp == stamp).then(|| {
-                (
-                    state.latest.get(service_id).cloned(),
-                    state.record_stamps.clone(),
-                )
-            })
+            (state.root_stamp == stamp).then(|| state.latest.get(service_id).cloned())
         };
-        if let Some((cached, record_stamps)) = cached {
-            if self.record_census(&record_stamps)?.unchanged {
-                if let Some(head) = cached.as_ref() {
-                    self.validate_cached_record(head)?;
-                }
-                return Ok(cached);
+        if let Some(cached) = cached {
+            if let Some(head) = cached.as_ref() {
+                self.validate_cached_record(head)?;
             }
+            return Ok(cached);
         }
 
         let scanned = self.scan_records()?;
-        self.replace_cached_state(&scanned.records, scanned.root_stamp, scanned.record_stamps)?;
+        self.replace_cached_state(&scanned.records, scanned.root_stamp)?;
         Ok(scanned
             .records
             .into_iter()
@@ -457,7 +417,6 @@ impl CheckpointStore {
         for _ in 0..3 {
             let before = root_stamp(&self.root, self.expected_uid)?;
             let mut records = Vec::new();
-            let mut record_stamps = BTreeMap::new();
             for entry in fs::read_dir(&self.root)? {
                 let entry = entry?;
                 let metadata = fs::symlink_metadata(entry.path())?;
@@ -470,7 +429,6 @@ impl CheckpointStore {
                         String::from_utf8_lossy(entry.file_name().as_bytes())
                     )));
                 }
-                record_stamps.insert(entry.path(), record_stamp_from_metadata(&metadata));
                 let bytes = fs::read(entry.path())?;
                 let record: CheckpointRecord = serde_json::from_slice(&bytes)
                     .map_err(|error| CheckpointError::Malformed(error.to_string()))?;
@@ -504,7 +462,6 @@ impl CheckpointStore {
                 return Ok(ScannedRecords {
                     records,
                     root_stamp: after,
-                    record_stamps,
                 });
             }
         }
@@ -520,18 +477,12 @@ impl CheckpointStore {
             if state.root_stamp != stamp {
                 None
             } else {
-                Some((
-                    state.latest.get(&peer_head.service_id).cloned(),
-                    state.record_stamps.clone(),
-                ))
+                Some(state.latest.get(&peer_head.service_id).cloned())
             }
         };
-        let Some((cached, record_stamps)) = cached else {
+        let Some(cached) = cached else {
             return Ok(false);
         };
-        if !self.record_census(&record_stamps)?.unchanged {
-            return Ok(false);
-        }
         let Some(cached) = cached else {
             return Ok(false);
         };
@@ -543,44 +494,6 @@ impl CheckpointStore {
         // history for an unchanged authenticated head.
         self.validate_cached_record(&cached)?;
         Ok(true)
-    }
-
-    fn record_census(
-        &self,
-        expected: &BTreeMap<PathBuf, RecordStamp>,
-    ) -> Result<RecordCensus, CheckpointError> {
-        let mut metadata_probes = 0;
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let path = entry.path();
-            let Some(expected_stamp) = expected.get(&path) else {
-                return Ok(RecordCensus {
-                    unchanged: false,
-                    metadata_probes,
-                });
-            };
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(RecordCensus {
-                        unchanged: false,
-                        metadata_probes,
-                    });
-                }
-                Err(error) => return Err(error.into()),
-            };
-            metadata_probes += 1;
-            if record_stamp_from_metadata(&metadata) != *expected_stamp {
-                return Ok(RecordCensus {
-                    unchanged: false,
-                    metadata_probes,
-                });
-            }
-        }
-        Ok(RecordCensus {
-            unchanged: metadata_probes == expected.len(),
-            metadata_probes,
-        })
     }
 
     fn validate_cached_record(&self, head: &SignedJournalHead) -> Result<(), CheckpointError> {
@@ -603,7 +516,6 @@ impl CheckpointStore {
         &self,
         records: &[CheckpointRecord],
         stamp: RootStamp,
-        record_stamps: BTreeMap<PathBuf, RecordStamp>,
     ) -> Result<(), CheckpointError> {
         let latest = records
             .iter()
@@ -617,7 +529,6 @@ impl CheckpointStore {
         *self.lock_state()? = CheckpointState {
             root_stamp: stamp,
             latest,
-            record_stamps,
         };
         Ok(())
     }
@@ -971,26 +882,6 @@ fn root_stamp(root: &Path, expected_uid: u32) -> Result<RootStamp, CheckpointErr
     })
 }
 
-fn record_stamp(path: &Path) -> Result<RecordStamp, CheckpointError> {
-    let metadata = fs::symlink_metadata(path)?;
-    Ok(record_stamp_from_metadata(&metadata))
-}
-
-fn record_stamp_from_metadata(metadata: &fs::Metadata) -> RecordStamp {
-    RecordStamp {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        mode: metadata.mode(),
-        uid: metadata.uid(),
-        links: metadata.nlink(),
-        size: metadata.size(),
-        modified_secs: metadata.mtime(),
-        modified_nanos: metadata.mtime_nsec(),
-        changed_secs: metadata.ctime(),
-        changed_nanos: metadata.ctime_nsec(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1144,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_authenticated_head_uses_the_record_census_fast_path() {
+    fn unchanged_authenticated_head_uses_bounded_tail_validation() {
         let directory = tempfile::tempdir().unwrap();
         let store = open_store(&directory);
         let mut expected = head(7, "11");
@@ -1153,24 +1044,17 @@ mod tests {
             expected = head(sequence, "11");
             assert_eq!(store.append(&expected).unwrap(), AppendOutcome::Appended);
         }
-        let retained_records = fs::read_dir(directory.path()).unwrap().count() as u64;
+        let retained_records = fs::read_dir(directory.path()).unwrap().count();
 
         for _ in 0..1_000 {
             assert!(store.cached_head_is_exact(&expected).unwrap());
         }
 
         assert_eq!(retained_records, 33);
-        let record_stamps = store.lock_state().unwrap().record_stamps.clone();
-        let census = store.record_census(&record_stamps).unwrap();
-        assert!(census.unchanged);
-        assert_eq!(
-            census.metadata_probes as u64, retained_records,
-            "the fast-path census must account for its O(history) metadata work"
-        );
     }
 
     #[test]
-    fn unchanged_head_fast_path_rejects_disk_tamper_and_directory_conflicts() {
+    fn unchanged_head_fast_path_rejects_tail_tamper_and_directory_conflicts() {
         let directory = tempfile::tempdir().unwrap();
         let store = open_store(&directory);
         let expected = head(7, "11");
@@ -1197,14 +1081,14 @@ mod tests {
         let mut historical_bytes = fs::read(&path).unwrap();
         *historical_bytes.last_mut().unwrap() ^= 1;
         fs::write(&path, historical_bytes).unwrap();
-        assert!(
-            store.append(&latest).is_err(),
-            "historical in-place tamper must fail before unchanged-head admission"
+        assert_eq!(
+            store.append(&latest).unwrap(),
+            AppendOutcome::AlreadyPresent,
+            "the bounded fast path validates the current tail, not every historical inode"
         );
 
-        // Restore the exact record, then prove an added unsafe sibling changes
-        // the root stamp and forces full fail-closed reconciliation.
-        fs::write(&path, serde_jcs::to_vec(&record).unwrap()).unwrap();
+        // A namespace change invalidates the root stamp and forces full
+        // fail-closed reconciliation, which observes historical tamper.
         let target = directory.path().join("outside");
         fs::write(&target, b"{}").unwrap();
         let link = directory.path().join("unsafe.jcs");
@@ -1261,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn finalization_reconciles_a_foreign_record_published_before_cache_update() {
+    fn restart_reconciles_a_writer_that_bypasses_the_directory_lock() {
         let directory = tempfile::tempdir().unwrap();
         let store = open_store(&directory);
         assert_eq!(
@@ -1307,7 +1191,20 @@ mod tests {
                 .unwrap()
                 .sequence
                 .get(),
-            3
+            2,
+            "the hot cache relies on every writer honoring the directory lock"
+        );
+        drop(store);
+        let reopened = open_store(&directory);
+        assert_eq!(
+            reopened
+                .latest(&foreign_head.service_id)
+                .unwrap()
+                .unwrap()
+                .sequence
+                .get(),
+            3,
+            "startup reconciliation must recover a record published outside the lock"
         );
     }
 
