@@ -474,14 +474,9 @@ impl CheckpointStore {
         let stamp = root_stamp(&self.root, self.expected_uid)?;
         let cached = {
             let state = self.lock_state()?;
-            if state.root_stamp != stamp {
-                None
-            } else {
-                Some(state.latest.get(&peer_head.service_id).cloned())
-            }
-        };
-        let Some(cached) = cached else {
-            return Ok(false);
+            (state.root_stamp == stamp)
+                .then(|| state.latest.get(&peer_head.service_id).cloned())
+                .flatten()
         };
         let Some(cached) = cached else {
             return Ok(false);
