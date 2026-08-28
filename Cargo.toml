@@ -3,6 +3,7 @@ members = [
   "crates/bloom-audit-checkpoint",
   "crates/bloom-platform-containment",
   "crates/bloom-rpc-wire",
+  "crates/bloom-service-observability",
   "crates/bloom-service-activation",
   "crates/bloom-triad-local-transport",
   "crates/bloom-trusted-time",
@@ -31,4 +32,6 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }

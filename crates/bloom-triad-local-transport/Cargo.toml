@@ -20,6 +20,7 @@ serde_json.workspace = true
 serde_jcs.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "net"] }
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

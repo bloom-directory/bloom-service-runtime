@@ -63,6 +63,71 @@ pub enum AppendOutcome {
     AlreadyPresent,
 }
 
+/// Allowlisted checkpoint head fields suitable for operational diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CheckpointHeadMetadata {
+    pub service_id: Token,
+    pub key_id: Token,
+    pub sequence: u64,
+    pub head_digest: String,
+}
+
+impl From<&SignedJournalHead> for CheckpointHeadMetadata {
+    fn from(head: &SignedJournalHead) -> Self {
+        Self {
+            service_id: head.service_id.clone(),
+            key_id: head.key_id.clone(),
+            sequence: head.sequence.get(),
+            head_digest: head.head_hash.as_str().to_owned(),
+        }
+    }
+}
+
+fn checkpoint_error_outcome(error: &CheckpointError) -> CheckpointDecisionOutcome {
+    match error {
+        CheckpointError::SequenceRollback => CheckpointDecisionOutcome::SequenceRollback,
+        CheckpointError::SequenceConflict => CheckpointDecisionOutcome::SequenceConflict,
+        CheckpointError::InvalidSignature => CheckpointDecisionOutcome::InvalidSignature,
+        CheckpointError::UnpinnedPeer => CheckpointDecisionOutcome::UnpinnedPeer,
+        CheckpointError::InvalidRoot
+        | CheckpointError::WrongOwner { .. }
+        | CheckpointError::InsecurePermissions
+        | CheckpointError::Malformed(_)
+        | CheckpointError::Io(_) => CheckpointDecisionOutcome::StorageOrConfigurationFailure,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointDecisionOutcome {
+    Appended,
+    AlreadyPresent,
+    SequenceRollback,
+    SequenceConflict,
+    InvalidSignature,
+    UnpinnedPeer,
+    StorageOrConfigurationFailure,
+}
+
+/// Evidence captured while the checkpoint directory lock is held.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CheckpointDecision {
+    /// Present for the concrete store; compatibility sinks may not know the
+    /// recipient identity and must not invent one.
+    pub recipient_service_id: Option<Token>,
+    pub attempted: CheckpointHeadMetadata,
+    pub retained: Option<CheckpointHeadMetadata>,
+    pub outcome: CheckpointDecisionOutcome,
+}
+
+#[derive(Debug, Error)]
+#[error("{source}")]
+pub struct CheckpointAppendError {
+    #[source]
+    pub source: CheckpointError,
+    pub decision: CheckpointDecision,
+}
+
 /// Injectable recipient-side sink used by Broker/Signer transport integration.
 /// Implementations must preserve the monotonic, independently retained peer
 /// head contract or return an error before a caller publishes mutation success.
@@ -71,6 +136,36 @@ pub trait CheckpointSink: Send + Sync {
         &self,
         peer_head: &SignedJournalHead,
     ) -> Result<AppendOutcome, CheckpointError>;
+
+    /// Diagnostic sibling for service integrations. Existing injected sinks
+    /// inherit a conservative adapter; `CheckpointStore` overrides this to
+    /// capture exact retained state at the append decision point.
+    #[allow(clippy::result_large_err)]
+    fn append_peer_head_diagnosed(
+        &self,
+        peer_head: &SignedJournalHead,
+    ) -> Result<CheckpointDecision, CheckpointAppendError> {
+        let attempted = CheckpointHeadMetadata::from(peer_head);
+        self.append_peer_head(peer_head)
+            .map(|outcome| CheckpointDecision {
+                recipient_service_id: None,
+                attempted: attempted.clone(),
+                retained: Some(attempted.clone()),
+                outcome: match outcome {
+                    AppendOutcome::Appended => CheckpointDecisionOutcome::Appended,
+                    AppendOutcome::AlreadyPresent => CheckpointDecisionOutcome::AlreadyPresent,
+                },
+            })
+            .map_err(|source| CheckpointAppendError {
+                decision: CheckpointDecision {
+                    recipient_service_id: None,
+                    attempted,
+                    retained: None,
+                    outcome: checkpoint_error_outcome(&source),
+                },
+                source,
+            })
+    }
 
     fn latest_peer_head(
         &self,
@@ -259,51 +354,134 @@ impl CheckpointStore {
     }
 
     pub fn append(&self, peer_head: &SignedJournalHead) -> Result<AppendOutcome, CheckpointError> {
-        let _operation = self
-            .operation
-            .lock()
-            .map_err(|_| CheckpointError::Malformed("checkpoint operation lock poisoned".into()))?;
-        let _directory = self.lock_directory(rustix::fs::FlockOperation::LockExclusive)?;
-        self.verify_live_head(peer_head)?;
-        if self.cached_head_is_exact(peer_head)? {
-            return Ok(AppendOutcome::AlreadyPresent);
-        }
+        self.append_diagnosed(peer_head)
+            .map(|decision| match decision.outcome {
+                CheckpointDecisionOutcome::Appended => AppendOutcome::Appended,
+                CheckpointDecisionOutcome::AlreadyPresent => AppendOutcome::AlreadyPresent,
+                _ => unreachable!("successful diagnosed append has a success outcome"),
+            })
+            .map_err(|failure| failure.source)
+    }
+
+    /// Appends a peer head and returns the exact attempted/retained evidence
+    /// observed under the decision lock. This is the preferred service-facing
+    /// API; `append` remains as a compatibility adapter.
+    #[allow(clippy::result_large_err)]
+    pub fn append_diagnosed(
+        &self,
+        peer_head: &SignedJournalHead,
+    ) -> Result<CheckpointDecision, CheckpointAppendError> {
+        let attempted = CheckpointHeadMetadata::from(peer_head);
+        let failure = |source, retained: Option<&SignedJournalHead>| CheckpointAppendError {
+            decision: CheckpointDecision {
+                recipient_service_id: Some(self.recipient_service_id.clone()),
+                attempted: attempted.clone(),
+                retained: retained.map(CheckpointHeadMetadata::from),
+                outcome: checkpoint_error_outcome(&source),
+            },
+            source,
+        };
+        let _operation = self.operation.lock().map_err(|_| {
+            failure(
+                CheckpointError::Malformed("checkpoint operation lock poisoned".into()),
+                None,
+            )
+        })?;
+        let _directory = self
+            .lock_directory(rustix::fs::FlockOperation::LockExclusive)
+            .map_err(|error| failure(error, None))?;
 
         // Startup establishes the verified history. A directory identity or
         // namespace change forces full reconciliation; otherwise the cached
         // verified tail is sufficient for this short-lived process cache.
         // Historical in-place tamper is detected on restart or the next
         // namespace change, while the exact current tail is validated below.
-        let stamp = root_stamp(&self.root, self.expected_uid)?;
-        let cache_is_current = self.lock_state()?.root_stamp == stamp;
+        let stamp =
+            root_stamp(&self.root, self.expected_uid).map_err(|error| failure(error, None))?;
+        let cache_is_current = self
+            .lock_state()
+            .map_err(|error| failure(error, None))?
+            .root_stamp
+            == stamp;
         if !cache_is_current {
-            let scanned = self.scan_records()?;
-            self.replace_cached_state(&scanned.records, scanned.root_stamp)?;
+            let scanned = self.scan_records().map_err(|error| failure(error, None))?;
+            self.replace_cached_state(&scanned.records, scanned.root_stamp)
+                .map_err(|error| failure(error, None))?;
         }
         let latest = self
-            .lock_state()?
+            .lock_state()
+            .map_err(|error| failure(error, None))?
             .latest
             .get(&peer_head.service_id)
             .cloned();
-        if let Some(latest) = latest {
-            if latest.key_id != peer_head.key_id && !self.valid_handover(&latest, peer_head) {
-                return Err(CheckpointError::SequenceConflict);
+        if let Some(latest) = latest.as_ref() {
+            // Diagnostics may claim a retained head only after checking the
+            // exact retained record while the directory lock is held.
+            self.validate_cached_record(latest)
+                .map_err(|error| failure(error, None))?;
+        }
+        self.verify_live_head(peer_head)
+            .map_err(|error| failure(error, latest.as_ref()))?;
+        if self
+            .cached_head_is_exact(peer_head)
+            .map_err(|error| failure(error, latest.as_ref()))?
+        {
+            return Ok(self.decision(
+                peer_head,
+                latest.as_ref(),
+                CheckpointDecisionOutcome::AlreadyPresent,
+            ));
+        }
+        if let Some(latest) = latest.as_ref() {
+            if latest.key_id != peer_head.key_id && !self.valid_handover(latest, peer_head) {
+                return Err(failure(CheckpointError::SequenceConflict, Some(latest)));
             }
             match peer_head.sequence.get().cmp(&latest.sequence.get()) {
-                std::cmp::Ordering::Less => return Err(CheckpointError::SequenceRollback),
-                std::cmp::Ordering::Equal if &latest == peer_head => {
-                    return Ok(AppendOutcome::AlreadyPresent);
+                std::cmp::Ordering::Less => {
+                    return Err(failure(CheckpointError::SequenceRollback, Some(latest)));
                 }
                 std::cmp::Ordering::Equal
-                    if self.valid_equal_sequence_handover(&latest, peer_head) => {}
-                std::cmp::Ordering::Equal => return Err(CheckpointError::SequenceConflict),
+                    if self.valid_equal_sequence_handover(latest, peer_head) => {}
+                std::cmp::Ordering::Equal => {
+                    return Err(failure(CheckpointError::SequenceConflict, Some(latest)));
+                }
                 std::cmp::Ordering::Greater => {}
             }
         }
 
-        let prepared = self.prepare_publication(peer_head)?;
-        let publication = self.publish_prepared(&prepared, peer_head)?;
-        self.finalize_publication(peer_head, &prepared, publication)
+        let prepared = self
+            .prepare_publication(peer_head)
+            .map_err(|error| failure(error, latest.as_ref()))?;
+        let publication = self
+            .publish_prepared(&prepared, peer_head)
+            // Publication may have observed or changed the destination. Do
+            // not claim the pre-publication head is still retained on error.
+            .map_err(|error| failure(error, None))?;
+        let outcome = self
+            .finalize_publication(peer_head, &prepared, publication)
+            .map_err(|error| failure(error, None))?;
+        Ok(self.decision(
+            peer_head,
+            Some(peer_head),
+            match outcome {
+                AppendOutcome::Appended => CheckpointDecisionOutcome::Appended,
+                AppendOutcome::AlreadyPresent => CheckpointDecisionOutcome::AlreadyPresent,
+            },
+        ))
+    }
+
+    fn decision(
+        &self,
+        attempted: &SignedJournalHead,
+        retained: Option<&SignedJournalHead>,
+        outcome: CheckpointDecisionOutcome,
+    ) -> CheckpointDecision {
+        CheckpointDecision {
+            recipient_service_id: Some(self.recipient_service_id.clone()),
+            attempted: CheckpointHeadMetadata::from(attempted),
+            retained: retained.map(CheckpointHeadMetadata::from),
+            outcome,
+        }
     }
 
     fn prepare_publication(
@@ -719,6 +897,13 @@ impl CheckpointSink for CheckpointStore {
         self.append(peer_head)
     }
 
+    fn append_peer_head_diagnosed(
+        &self,
+        peer_head: &SignedJournalHead,
+    ) -> Result<CheckpointDecision, CheckpointAppendError> {
+        self.append_diagnosed(peer_head)
+    }
+
     fn latest_peer_head(
         &self,
         service_id: &Token,
@@ -1031,6 +1216,53 @@ mod tests {
             reopened.append(&head(11, "55")).unwrap(),
             AppendOutcome::AlreadyPresent
         );
+    }
+
+    #[test]
+    fn diagnosed_append_preserves_attempted_and_retained_heads_for_each_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(&directory);
+        let first = head(7, "11");
+        let appended = store.append_diagnosed(&first).unwrap();
+        assert_eq!(appended.outcome, CheckpointDecisionOutcome::Appended);
+        assert_eq!(appended.attempted.sequence, 7);
+        assert_eq!(
+            appended.retained.as_ref().unwrap().head_digest,
+            "11".repeat(32)
+        );
+
+        let duplicate = store.append_diagnosed(&first).unwrap();
+        assert_eq!(duplicate.outcome, CheckpointDecisionOutcome::AlreadyPresent);
+
+        for (attempt, expected) in [
+            (head(6, "22"), CheckpointDecisionOutcome::SequenceRollback),
+            (head(7, "22"), CheckpointDecisionOutcome::SequenceConflict),
+        ] {
+            let failure = store.append_diagnosed(&attempt).unwrap_err();
+            assert_eq!(failure.decision.outcome, expected);
+            assert_eq!(failure.decision.attempted.head_digest, "22".repeat(32));
+            let retained = failure.decision.retained.unwrap();
+            assert_eq!(retained.sequence, 7);
+            assert_eq!(retained.head_digest, "11".repeat(32));
+        }
+
+        let mut forged = head(8, "33");
+        forged.signature = Base64UrlBytes::from_bytes(&[0; 64]);
+        let failure = store.append_diagnosed(&forged).unwrap_err();
+        assert_eq!(
+            failure.decision.outcome,
+            CheckpointDecisionOutcome::InvalidSignature
+        );
+        assert_eq!(failure.decision.retained.unwrap().sequence, 7);
+
+        let mut unknown = keyed_head(&rotated_signing_key(), "unknown-key", 8, "44");
+        unknown.service_id = Token::new("unknown-service").unwrap();
+        let failure = store.append_diagnosed(&unknown).unwrap_err();
+        assert_eq!(
+            failure.decision.outcome,
+            CheckpointDecisionOutcome::UnpinnedPeer
+        );
+        assert!(failure.decision.retained.is_none());
     }
 
     #[test]
@@ -1596,5 +1828,14 @@ mod tests {
             Err(CheckpointError::Io(error))
                 if error.kind() == std::io::ErrorKind::PermissionDenied
         ));
+        let failure = sink.append_peer_head_diagnosed(&head(1, "11")).unwrap_err();
+        assert_eq!(
+            failure.decision.outcome,
+            CheckpointDecisionOutcome::StorageOrConfigurationFailure
+        );
+        assert!(
+            failure.decision.retained.is_none(),
+            "a storage failure must not claim a retained head without exact evidence"
+        );
     }
 }
