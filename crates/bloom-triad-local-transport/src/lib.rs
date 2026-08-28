@@ -1114,7 +1114,7 @@ where
     Dispatch: FnOnce(T, AuthenticatedRequestContext) -> DispatchFuture,
     DispatchFuture: Future<Output = Result<U, E>>,
 {
-    let request = receive_request::<T>(
+    let request = match receive_request::<T>(
         stream,
         identity,
         client,
@@ -1123,7 +1123,19 @@ where
         JournalHeadPolicy::Forbidden,
     )
     .await
-    .map_err(E::from)?;
+    {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(
+                event = "rpc.admission_rejected",
+                stage = "receive_request",
+                error_code = ?error.code,
+                expected_peer_service_id = %client.service_id,
+                expected_peer_key_id = %client.application_key_id,
+            );
+            return Err(E::from(error));
+        }
+    };
     let context = AuthenticatedRequestContext::from_request(&request);
     let span = context.request_span();
     async move {
@@ -1232,7 +1244,7 @@ where
     Dispatch: FnOnce(T, AuthenticatedRequestContext) -> DispatchFuture,
     DispatchFuture: Future<Output = Result<U, E>>,
 {
-    let request = receive_request::<T>(
+    let request = match receive_request::<T>(
         stream,
         identity,
         client,
@@ -1241,7 +1253,19 @@ where
         JournalHeadPolicy::Required,
     )
     .await
-    .map_err(E::from)?;
+    {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(
+                event = "rpc.admission_rejected",
+                stage = "receive_request",
+                error_code = ?error.code,
+                expected_peer_service_id = %client.service_id,
+                expected_peer_key_id = %client.application_key_id,
+            );
+            return Err(E::from(error));
+        }
+    };
     let context = AuthenticatedRequestContext::from_request(&request);
     let span = context.request_span();
     async move {

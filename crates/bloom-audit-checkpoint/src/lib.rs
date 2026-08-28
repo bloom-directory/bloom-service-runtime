@@ -414,6 +414,7 @@ impl CheckpointStore {
             .latest
             .get(&peer_head.service_id)
             .cloned();
+        let already_present = latest.as_ref().is_some_and(|latest| latest == peer_head);
         if let Some(latest) = latest.as_ref() {
             // Diagnostics may claim a retained head only after checking the
             // exact retained record while the directory lock is held.
@@ -422,10 +423,7 @@ impl CheckpointStore {
         }
         self.verify_live_head(peer_head)
             .map_err(|error| failure(error, latest.as_ref()))?;
-        if self
-            .cached_head_is_exact(peer_head)
-            .map_err(|error| failure(error, latest.as_ref()))?
-        {
+        if already_present {
             return Ok(self.decision(
                 peer_head,
                 latest.as_ref(),
@@ -650,27 +648,6 @@ impl CheckpointStore {
         Err(CheckpointError::Malformed(
             "checkpoint root changed repeatedly during reconciliation".into(),
         ))
-    }
-
-    fn cached_head_is_exact(&self, peer_head: &SignedJournalHead) -> Result<bool, CheckpointError> {
-        let stamp = root_stamp(&self.root, self.expected_uid)?;
-        let cached = {
-            let state = self.lock_state()?;
-            (state.root_stamp == stamp)
-                .then(|| state.latest.get(&peer_head.service_id).cloned())
-                .flatten()
-        };
-        let Some(cached) = cached else {
-            return Ok(false);
-        };
-        if cached != *peer_head {
-            return Ok(false);
-        }
-        // Reading and validating the single cached tail keeps in-place
-        // replacement/tamper fail-closed without rescanning an ever-growing
-        // history for an unchanged authenticated head.
-        self.validate_cached_record(&cached)?;
-        Ok(true)
     }
 
     fn validate_cached_record(&self, head: &SignedJournalHead) -> Result<(), CheckpointError> {
@@ -1278,7 +1255,10 @@ mod tests {
         let retained_records = fs::read_dir(directory.path()).unwrap().count();
 
         for _ in 0..1_000 {
-            assert!(store.cached_head_is_exact(&expected).unwrap());
+            assert_eq!(
+                store.append_diagnosed(&expected).unwrap().outcome,
+                CheckpointDecisionOutcome::AlreadyPresent
+            );
         }
 
         assert_eq!(retained_records, 33);
