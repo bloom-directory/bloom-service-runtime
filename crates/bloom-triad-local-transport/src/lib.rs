@@ -31,6 +31,7 @@ use tokio::{
     net::UnixStream,
     sync::{OwnedSemaphorePermit, Semaphore},
 };
+use tracing::Instrument as _;
 
 const HELLO_DOMAIN: &[u8] = b"bloom-local-hello/v1";
 const FRAME_MAX_BYTES: usize = 1024 * 1024;
@@ -158,6 +159,43 @@ pub struct PeerAcl {
     pub boot_epoch: BootEpoch,
     pub application_key_id: Token,
     pub application_public_key: [u8; 32],
+}
+
+/// Safe, tracing-neutral facts copied from an authenticated request envelope.
+/// Constructed by the transport only after all envelope checks have passed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedRequestContext {
+    pub method: Token,
+    pub operation_id: OperationId,
+    pub caller_service_id: Token,
+    pub caller_boot_epoch: BootEpoch,
+    pub caller_application_key_id: Token,
+    pub sent_at_ms: u64,
+    pub deadline_ms: u64,
+}
+
+impl AuthenticatedRequestContext {
+    fn from_request<T>(request: &SignedEnvelope<T>) -> Self {
+        Self {
+            method: request.unsigned.method.clone(),
+            operation_id: request.unsigned.operation_id.clone(),
+            caller_service_id: request.unsigned.caller_service_id.clone(),
+            caller_boot_epoch: request.unsigned.caller_boot_epoch.clone(),
+            caller_application_key_id: request.unsigned.application_key_id.clone(),
+            sent_at_ms: request.unsigned.sent_at_ms.get(),
+            deadline_ms: request.unsigned.deadline_ms.get(),
+        }
+    }
+
+    fn request_span(&self) -> tracing::Span {
+        tracing::info_span!(
+            "authenticated_request",
+            rpc_method = %self.method,
+            operation_id = %self.operation_id,
+            peer_service_id = %self.caller_service_id,
+            peer_key_id = %self.caller_application_key_id,
+        )
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -343,6 +381,7 @@ fn require_developer_root(path: &Path, uid: u32) -> Result<std::path::PathBuf, P
 /// `is_dir()` already establishes the type, and `symlink_metadata` succeeding
 /// establishes that the name resolves; the caller additionally confirms the
 /// canonical path is the same object.
+#[cfg(feature = "triad-dev-harness")]
 fn require_developer_root_shape(metadata: &fs::Metadata, uid: u32) -> Result<(), ProtocolError> {
     if !metadata.file_type().is_dir()
         || metadata.file_type().is_symlink()
@@ -1008,7 +1047,25 @@ pub trait JournalExchange<E>: Send + Sync {
         peer_head: &SignedJournalHead,
     ) -> Result<(), E>;
 
+    /// Context-aware sibling used by endpoints that need authenticated
+    /// operation identity at the checkpoint decision. Existing implementors
+    /// inherit the compatibility adapter.
+    fn checkpoint_request_head_with_context(
+        &self,
+        context: &AuthenticatedRequestContext,
+        peer_head: &SignedJournalHead,
+    ) -> Result<(), E> {
+        self.checkpoint_request_head(&context.method, peer_head)
+    }
+
     fn local_journal_head(&self, method: &Token) -> Result<(u64, Digest32), E>;
+
+    fn local_journal_head_with_context(
+        &self,
+        context: &AuthenticatedRequestContext,
+    ) -> Result<(u64, Digest32), E> {
+        self.local_journal_head(&context.method)
+    }
 }
 
 pub async fn dispatch_connection<T, U, E, Dispatch, DispatchFuture>(
@@ -1027,7 +1084,37 @@ where
     Dispatch: FnOnce(T) -> DispatchFuture,
     DispatchFuture: Future<Output = Result<U, E>>,
 {
-    let request = receive_request::<T>(
+    dispatch_connection_with_context(
+        stream,
+        identity,
+        client,
+        current_version,
+        supported_versions,
+        quota,
+        |request, _context| dispatch(request),
+    )
+    .await
+}
+
+/// Dispatches a request with its authenticated envelope context. The dispatch
+/// future is instrumented so its request span remains attached across awaits.
+pub async fn dispatch_connection_with_context<T, U, E, Dispatch, DispatchFuture>(
+    stream: &mut UnixStream,
+    identity: &LocalIdentity,
+    client: &PeerAcl,
+    current_version: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
+    quota: &EndpointQuota,
+    dispatch: Dispatch,
+) -> Result<(), E>
+where
+    T: Clone + DeserializeOwned + Serialize + TypedRequestMethod,
+    U: Serialize,
+    E: From<ProtocolError> + Serialize,
+    Dispatch: FnOnce(T, AuthenticatedRequestContext) -> DispatchFuture,
+    DispatchFuture: Future<Output = Result<U, E>>,
+{
+    let request = match receive_request::<T>(
         stream,
         identity,
         client,
@@ -1036,23 +1123,76 @@ where
         JournalHeadPolicy::Forbidden,
     )
     .await
-    .map_err(E::from)?;
-    let admission = match quota.admit(
-        request.unsigned.body.is_read_only(),
-        now_ms().map_err(E::from)?,
-    ) {
-        Ok(admission) => admission,
+    {
+        Ok(request) => request,
         Err(error) => {
-            return send_response::<_, U, E>(stream, identity, &request, Err(E::from(error)))
-                .await
-                .map_err(E::from);
+            tracing::warn!(
+                event = "rpc.admission_rejected",
+                stage = "receive_request",
+                error_code = ?error.code,
+                expected_peer_service_id = %client.service_id,
+                expected_peer_key_id = %client.application_key_id,
+            );
+            return Err(E::from(error));
         }
     };
-    let result = dispatch(request.unsigned.body.clone()).await;
-    drop(admission);
-    send_response::<_, U, E>(stream, identity, &request, result)
-        .await
-        .map_err(E::from)
+    let context = AuthenticatedRequestContext::from_request(&request);
+    let span = context.request_span();
+    async move {
+        let observed_at_ms = match now_ms() {
+            Ok(observed_at_ms) => observed_at_ms,
+            Err(error) => {
+                tracing::error!(
+                    event = "rpc.transport_failed",
+                    stage = "request_time",
+                    error_code = ?error.code,
+                );
+                return Err(E::from(error));
+            }
+        };
+        let admission = match quota.admit(request.unsigned.body.is_read_only(), observed_at_ms) {
+            Ok(admission) => admission,
+            Err(error) => {
+                let error_code = error.code;
+                let sent =
+                    send_response::<_, U, E>(stream, identity, &request, Err(E::from(error))).await;
+                return match sent {
+                    Ok(()) => {
+                        tracing::warn!(
+                            event = "rpc.completed",
+                            outcome = "rejected",
+                            stage = "quota",
+                            error_code = ?error_code,
+                        );
+                        Ok(())
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            event = "rpc.transport_failed",
+                            stage = "response_write",
+                            error_code = ?error.code,
+                        );
+                        Err(E::from(error))
+                    }
+                };
+            }
+        };
+        let result = dispatch(request.unsigned.body.clone(), context).await;
+        drop(admission);
+        match send_response::<_, U, E>(stream, identity, &request, result).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::error!(
+                    event = "rpc.transport_failed",
+                    stage = "response_write",
+                    error_code = ?error.code,
+                );
+                Err(E::from(error))
+            }
+        }
+    }
+    .instrument(span)
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1073,7 +1213,38 @@ where
     Dispatch: FnOnce(T) -> DispatchFuture,
     DispatchFuture: Future<Output = Result<U, E>>,
 {
-    let request = receive_request::<T>(
+    dispatch_connection_with_journal_heads_and_context(
+        stream,
+        identity,
+        client,
+        current_version,
+        supported_versions,
+        quota,
+        journals,
+        |request, _context| dispatch(request),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_connection_with_journal_heads_and_context<T, U, E, Dispatch, DispatchFuture>(
+    stream: &mut UnixStream,
+    identity: &LocalIdentity,
+    client: &PeerAcl,
+    current_version: ProtocolVersion,
+    supported_versions: ProtocolVersionRange,
+    quota: &EndpointQuota,
+    journals: &dyn JournalExchange<E>,
+    dispatch: Dispatch,
+) -> Result<(), E>
+where
+    T: Clone + DeserializeOwned + Serialize + TypedRequestMethod,
+    U: Serialize,
+    E: From<ProtocolError> + Serialize,
+    Dispatch: FnOnce(T, AuthenticatedRequestContext) -> DispatchFuture,
+    DispatchFuture: Future<Output = Result<U, E>>,
+{
+    let request = match receive_request::<T>(
         stream,
         identity,
         client,
@@ -1082,47 +1253,134 @@ where
         JournalHeadPolicy::Required,
     )
     .await
-    .map_err(E::from)?;
-    let method = &request.unsigned.method;
-    let peer_head = request
-        .unsigned
-        .sender_journal_head
-        .as_ref()
-        .ok_or_else(|| {
-            E::from(ProtocolError::new(
-                ProtocolErrorCode::UnauthenticatedPeer,
-                "authority-edge request omitted its authenticated journal head",
-            ))
-        })?;
-    if let Err(error) = journals.checkpoint_request_head(method, peer_head) {
-        let (sequence, head_hash) = journals.local_journal_head(method)?;
-        let head = sign_journal_head(identity, sequence, head_hash);
-        return send_response_with_journal_head::<_, U, E>(
-            stream,
-            identity,
-            &request,
-            Err(error),
-            head,
-        )
-        .await
-        .map_err(E::from);
-    }
-    let result = match quota.admit(
-        request.unsigned.body.is_read_only(),
-        now_ms().map_err(E::from)?,
-    ) {
-        Ok(admission) => {
-            let result = dispatch(request.unsigned.body.clone()).await;
-            drop(admission);
-            result
+    {
+        Ok(request) => request,
+        Err(error) => {
+            tracing::warn!(
+                event = "rpc.admission_rejected",
+                stage = "receive_request",
+                error_code = ?error.code,
+                expected_peer_service_id = %client.service_id,
+                expected_peer_key_id = %client.application_key_id,
+            );
+            return Err(E::from(error));
         }
-        Err(error) => Err(E::from(error)),
     };
-    let (sequence, head_hash) = journals.local_journal_head(method)?;
-    let head = sign_journal_head(identity, sequence, head_hash);
-    send_response_with_journal_head::<_, U, E>(stream, identity, &request, result, head)
-        .await
-        .map_err(E::from)
+    let context = AuthenticatedRequestContext::from_request(&request);
+    let span = context.request_span();
+    async move {
+        let peer_head = request
+            .unsigned
+            .sender_journal_head
+            .as_ref()
+            .ok_or_else(|| {
+                E::from(ProtocolError::new(
+                    ProtocolErrorCode::UnauthenticatedPeer,
+                    "authority-edge request omitted its authenticated journal head",
+                ))
+            })?;
+        if let Err(error) = journals.checkpoint_request_head_with_context(&context, peer_head) {
+            let (sequence, head_hash) = match journals.local_journal_head_with_context(&context) {
+                Ok(head) => head,
+                Err(local_error) => {
+                    tracing::error!(
+                        event = "rpc.transport_failed",
+                        stage = "local_journal_head",
+                        error_code = "local_journal_head_failed",
+                    );
+                    return Err(local_error);
+                }
+            };
+            let head = sign_journal_head(identity, sequence, head_hash);
+            let sent = send_response_with_journal_head::<_, U, E>(
+                stream,
+                identity,
+                &request,
+                Err(error),
+                head,
+            )
+            .await;
+            return match sent {
+                Ok(()) => {
+                    tracing::warn!(
+                        event = "rpc.completed",
+                        outcome = "rejected",
+                        stage = "checkpoint",
+                        error_code = "checkpoint_rejected",
+                    );
+                    Ok(())
+                }
+                Err(response_error) => {
+                    tracing::error!(
+                        event = "rpc.transport_failed",
+                        stage = "response_journal_head",
+                        error_code = ?response_error.code,
+                    );
+                    Err(E::from(response_error))
+                }
+            };
+        }
+        let observed_at_ms = match now_ms() {
+            Ok(observed_at_ms) => observed_at_ms,
+            Err(error) => {
+                tracing::error!(
+                    event = "rpc.transport_failed",
+                    stage = "request_time",
+                    error_code = ?error.code,
+                );
+                return Err(E::from(error));
+            }
+        };
+        let (result, quota_error_code) =
+            match quota.admit(request.unsigned.body.is_read_only(), observed_at_ms) {
+                Ok(admission) => {
+                    let result = dispatch(request.unsigned.body.clone(), context.clone()).await;
+                    drop(admission);
+                    (result, None)
+                }
+                Err(error) => {
+                    let error_code = error.code;
+                    (Err(E::from(error)), Some(error_code))
+                }
+            };
+        let (sequence, head_hash) = match journals.local_journal_head_with_context(&context) {
+            Ok(head) => head,
+            Err(error) => {
+                tracing::error!(
+                    event = "rpc.transport_failed",
+                    stage = "local_journal_head",
+                    error_code = "local_journal_head_failed",
+                );
+                return Err(error);
+            }
+        };
+        let head = sign_journal_head(identity, sequence, head_hash);
+        match send_response_with_journal_head::<_, U, E>(stream, identity, &request, result, head)
+            .await
+        {
+            Ok(()) => {
+                if let Some(error_code) = quota_error_code {
+                    tracing::warn!(
+                        event = "rpc.completed",
+                        outcome = "rejected",
+                        stage = "quota",
+                        error_code = ?error_code,
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(
+                    event = "rpc.transport_failed",
+                    stage = "response_journal_head",
+                    error_code = ?error.code,
+                );
+                Err(E::from(error))
+            }
+        }
+    }
+    .instrument(span)
+    .await
 }
 
 pub async fn write_frame<T: Serialize>(
@@ -1968,6 +2226,70 @@ mod tests {
             ProtocolErrorCode::UnsupportedVersion
         );
         assert_eq!(service.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn context_dispatch_exposes_authenticated_operation_identity() {
+        let (mut client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let uid = client_stream.peer_cred().unwrap().uid();
+        let client_identity = identity("context-client", 12);
+        let server_identity = identity("context-server", 13);
+        let client_acl = acl(&client_identity, uid);
+        let server_acl = acl(&server_identity, uid);
+        let quota = EndpointQuota::new(1, 10, 1_000, 10, 1_000).unwrap();
+        let operation_id = OperationId::from_bytes([0x81; 32]);
+        let request = FixtureRequest::Mutate {
+            operation_id: operation_id.clone(),
+        };
+
+        let (client_result, server_result) = tokio::join!(
+            super::call::<_, FixtureResponse, ProtocolError>(
+                &mut client_stream,
+                &client_identity,
+                &server_acl,
+                TEST_CURRENT,
+                TEST_RANGE,
+                request,
+                5_000,
+            ),
+            super::dispatch_connection_with_context::<
+                FixtureRequest,
+                FixtureResponse,
+                ProtocolError,
+                _,
+                _,
+            >(
+                &mut server_stream,
+                &server_identity,
+                &client_acl,
+                TEST_CURRENT,
+                TEST_RANGE,
+                &quota,
+                |request, context| {
+                    let expected_operation = operation_id.clone();
+                    let expected_service = client_identity.service_id.clone();
+                    async move {
+                        assert_eq!(context.operation_id, expected_operation);
+                        assert_eq!(context.caller_service_id, expected_service);
+                        assert_eq!(context.method, request.method().unwrap());
+                        assert_eq!(
+                            context.caller_application_key_id.as_str(),
+                            "context-client-app"
+                        );
+                        Ok(FixtureResponse::Mutated {
+                            operation_id: context.operation_id,
+                        })
+                    }
+                },
+            )
+        );
+        server_result.unwrap();
+        assert_eq!(
+            client_result.unwrap(),
+            FixtureResponse::Mutated {
+                operation_id: OperationId::from_bytes([0x81; 32])
+            }
+        );
     }
 
     #[tokio::test]
