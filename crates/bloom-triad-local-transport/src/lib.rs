@@ -23,7 +23,7 @@ use bloom_rpc_wire::{
     encode_frame,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 use tokio::{
@@ -1487,13 +1487,19 @@ fn peer_uid(stream: &UnixStream) -> Result<u32, ProtocolError> {
 
 fn random_digest() -> Digest32 {
     let mut bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    // Preserve direct OS entropy and the previous panic-on-failure behavior.
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("operating system randomness unavailable");
     Digest32::from_bytes(bytes)
 }
 
 fn random_operation_id() -> OperationId {
     let mut bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    // Preserve direct OS entropy and the previous panic-on-failure behavior.
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("operating system randomness unavailable");
     OperationId::from_bytes(bytes)
 }
 

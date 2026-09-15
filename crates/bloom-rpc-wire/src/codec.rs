@@ -90,7 +90,15 @@ impl Base64UrlBytes {
         if encoded.contains('=') {
             return Err(malformed("base64url values must be unpadded"));
         }
-        let decoded = URL_SAFE_NO_PAD.decode(&encoded).map_err(malformed)?;
+        let decoded = URL_SAFE_NO_PAD.decode(&encoded).map_err(|error| {
+            // Keep the wire diagnostic stable across base64's error API change.
+            match error {
+                base64::DecodeError::InvalidLastSymbol { offset, symbol, .. } => {
+                    malformed(format!("Invalid last symbol {symbol}, offset {offset}."))
+                }
+                other => malformed(other),
+            }
+        })?;
         if URL_SAFE_NO_PAD.encode(decoded) != encoded {
             return Err(malformed("base64url value is noncanonical"));
         }
@@ -128,6 +136,45 @@ fn limit(message: impl Into<String>) -> WireError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64url_wire_vectors_remain_canonical() {
+        for (bytes, encoded) in [
+            (&b""[..], ""),
+            (&b"f"[..], "Zg"),
+            (&b"fo"[..], "Zm8"),
+            (&b"foo"[..], "Zm9v"),
+            (&[0xfb, 0xff, 0xff][..], "-___"),
+        ] {
+            let value = Base64UrlBytes::from_bytes(bytes);
+            assert_eq!(value.encoded(), encoded);
+            assert_eq!(Base64UrlBytes::parse(encoded).unwrap().decode(), bytes);
+            assert_eq!(
+                serde_json::to_string(&value).unwrap(),
+                format!("\"{encoded}\"")
+            );
+        }
+        for invalid in ["Zg=", "Zg==", "Zh", "Zm9", "+///", "Z g", "Zg\n", "Z"] {
+            assert_eq!(
+                Base64UrlBytes::parse(invalid).unwrap_err().code,
+                WireErrorCode::MalformedFrame,
+                "accepted {invalid:?}"
+            );
+        }
+        assert_eq!(
+            Base64UrlBytes::parse("Zh").unwrap_err().message,
+            "Invalid last symbol 104, offset 1."
+        );
+        // Cover all byte values and lengths around scalar/SIMD block boundaries.
+        let bytes: Vec<u8> = (0..=255).collect();
+        for length in 0..=bytes.len() {
+            let value = Base64UrlBytes::from_bytes(&bytes[..length]);
+            assert_eq!(
+                Base64UrlBytes::parse(value.encoded()).unwrap().decode(),
+                &bytes[..length]
+            );
+        }
+    }
 
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(deny_unknown_fields)]
