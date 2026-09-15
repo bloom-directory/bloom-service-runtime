@@ -18,7 +18,7 @@ license = "MIT"
 repository = "https://github.com/bloom-directory/bloom-service-runtime"
 
 [workspace.dependencies]
-base64 = "0.22"
+base64 = "0.23"
 bloom-rpc-wire = { path = "crates/bloom-rpc-wire" }
 bloom-trusted-time = { path = "crates/bloom-trusted-time" }
 ed25519-dalek = { version = "3", features = ["rand_core"] }
