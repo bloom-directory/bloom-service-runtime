@@ -21,7 +21,7 @@ repository = "https://github.com/bloom-directory/bloom-service-runtime"
 base64 = "0.22"
 bloom-rpc-wire = { path = "crates/bloom-rpc-wire" }
 bloom-trusted-time = { path = "crates/bloom-trusted-time" }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 hex = "0.4"
 libc = "0.2"
 rand = "0.8"
