@@ -422,6 +422,18 @@ mod tests {
     }
 
     #[test]
+    fn request_digest_matches_fixed_wire_vector() {
+        let (envelope, _) = signed();
+        assert_eq!(
+            envelope.unsigned.expected_request_digest().unwrap(),
+            Digest32::new(
+                "bfd4d039e9f8aca33b52a877ded02f73846f28f9095c2bba178316be62ef7c1f".to_owned()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn typed_transport_operation_uses_the_stable_body_operation() {
         let operation_id = OperationId::from_bytes([44; 32]);
         let request = OperationRequestFixture::Mutate {

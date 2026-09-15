@@ -13,7 +13,7 @@ jobs:
   workspace:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Assert product repos are absent
@@ -35,7 +35,7 @@ jobs:
     name: macOS W0 launchd listener retry
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Exercise real launchd socket ownership and retry
@@ -51,7 +51,7 @@ jobs:
     name: Linux W0 UID isolation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         run: rustup show
       - name: Build UID-isolation test as the unprivileged runner
