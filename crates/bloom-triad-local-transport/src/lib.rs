@@ -903,14 +903,28 @@ where
     U: Serialize + DeserializeOwned,
     E: DeserializeOwned + Serialize,
 {
-    authenticate_client(
-        stream,
-        identity,
-        server,
-        current_version,
-        supported_versions,
+    // A peer that stops responding must not hang the caller. The handshake
+    // gets `timeout_ms`; the request and its response get twice that, since a
+    // server may legitimately still be working after the request's own
+    // deadline. Expiry is SERVICE_UNAVAILABLE, whose contract already says
+    // the outcome is unknown and must be resolved by status.
+    let deadline = |ms: u64| std::time::Duration::from_millis(ms);
+    tokio::time::timeout(
+        deadline(timeout_ms),
+        authenticate_client(
+            stream,
+            identity,
+            server,
+            current_version,
+            supported_versions,
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| {
+        unavailable(format!(
+            "peer did not complete the handshake within {timeout_ms} ms"
+        ))
+    })??;
     let observed_uid = peer_uid(stream)?;
     let sent_at_ms = now_ms()?;
     let operation_id = body.operation_id()?.unwrap_or_else(random_operation_id);
@@ -925,9 +939,18 @@ where
         sent_at_ms.saturating_add(timeout_ms),
         sender_journal_head,
     )?;
-    write_frame(stream, &request).await?;
-
-    let response: SignedEnvelope<Result<U, E>> = read_frame(stream).await?;
+    let response: SignedEnvelope<Result<U, E>> =
+        tokio::time::timeout(deadline(timeout_ms.saturating_mul(2)), async {
+            write_frame(stream, &request).await?;
+            read_frame(stream).await
+        })
+        .await
+        .map_err(|_| {
+            unavailable(format!(
+                "peer did not answer within {} ms; the outcome is unknown",
+                timeout_ms.saturating_mul(2)
+            ))
+        })??;
     response.verify_response_to(
         observed_uid,
         &server.authenticated_for(identity.service_id.clone()),
@@ -2232,6 +2255,65 @@ mod tests {
             ProtocolErrorCode::UnsupportedVersion
         );
         assert_eq!(service.0.load(Ordering::SeqCst), 0);
+    }
+
+    /// A peer that stops answering fails the call within its bound instead of
+    /// hanging it: silent through the handshake, or silent after reading the
+    /// request.
+    #[tokio::test]
+    async fn a_silent_peer_fails_the_call_within_its_deadline() {
+        for answer_handshake in [false, true] {
+            let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+            let uid = client_stream.peer_cred().unwrap().uid();
+            let client_identity = identity("deadline-client", 14);
+            let server_identity = identity("deadline-server", 15);
+            let client_acl = acl(&client_identity, uid);
+            let server_acl = acl(&server_identity, uid);
+            let client = async {
+                let started = std::time::Instant::now();
+                let result = super::call::<_, FixtureResponse, ProtocolError>(
+                    &mut client_stream,
+                    &client_identity,
+                    &server_acl,
+                    TEST_CURRENT,
+                    TEST_RANGE,
+                    FixtureRequest::Read {
+                        value: Digest32::from_bytes([0x14; 32]),
+                    },
+                    200,
+                )
+                .await;
+                (result, started.elapsed())
+            };
+            // The server owns its stream and drops it after 1.5 s, so a
+            // missing bound fails the timing assertion instead of hanging.
+            let silent_server = async move {
+                let mut server_stream = server_stream;
+                if answer_handshake {
+                    let _ = super::receive_request::<FixtureRequest>(
+                        &mut server_stream,
+                        &server_identity,
+                        &client_acl,
+                        TEST_CURRENT,
+                        TEST_RANGE,
+                        JournalHeadPolicy::Forbidden,
+                    )
+                    .await;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+            };
+            let ((result, elapsed), ()) = tokio::join!(client, silent_server);
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.code,
+                ProtocolErrorCode::ServiceUnavailable,
+                "{error:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_millis(1_000),
+                "answer_handshake={answer_handshake}: took {elapsed:?}"
+            );
+        }
     }
 
     #[tokio::test]
