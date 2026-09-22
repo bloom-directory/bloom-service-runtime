@@ -904,10 +904,11 @@ where
     E: DeserializeOwned + Serialize,
 {
     // A peer that stops responding must not hang the caller. The handshake
-    // gets `timeout_ms`; the request and its response get twice that, since a
-    // server may legitimately still be working after the request's own
-    // deadline. Expiry is SERVICE_UNAVAILABLE, whose contract already says
-    // the outcome is unknown and must be resolved by status.
+    // and the request/response round trip each get `timeout_ms`: a response
+    // can never validly arrive after the request's own deadline, so waiting
+    // longer would only delay the inevitable. Expiry is SERVICE_UNAVAILABLE,
+    // whose contract already says the outcome is unknown and must be
+    // resolved by status.
     let deadline = |ms: u64| std::time::Duration::from_millis(ms);
     tokio::time::timeout(
         deadline(timeout_ms),
@@ -940,15 +941,14 @@ where
         sender_journal_head,
     )?;
     let response: SignedEnvelope<Result<U, E>> =
-        tokio::time::timeout(deadline(timeout_ms.saturating_mul(2)), async {
+        tokio::time::timeout(deadline(timeout_ms), async {
             write_frame(stream, &request).await?;
             read_frame(stream).await
         })
         .await
         .map_err(|_| {
             unavailable(format!(
-                "peer did not answer within {} ms; the outcome is unknown",
-                timeout_ms.saturating_mul(2)
+                "peer did not answer within {timeout_ms} ms; the outcome is unknown"
             ))
         })??;
     response.verify_response_to(
