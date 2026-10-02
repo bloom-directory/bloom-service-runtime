@@ -1470,6 +1470,25 @@ fn hello_message(hello: &HelloChallenge) -> Result<Vec<u8>, ProtocolError> {
     Ok(message)
 }
 
+/// Check the kernel-reported effective UID on a dedicated local admin socket.
+///
+/// The caller owns the administrative policy and must obtain `expected_uid`
+/// from protected installation state (root for a privileged admin client),
+/// never from the incoming request. Clients must also check the server's UID.
+/// This does not authenticate an application identity when services share a
+/// UID and must not replace the signed hello on ordinary authority RPC edges.
+/// Tokio uses the platform's Unix peer-credential facility; no claimed UID or
+/// filesystem socket ownership is used as a substitute.
+pub fn require_local_admin_peer(stream: &UnixStream, expected_uid: u32) -> std::io::Result<()> {
+    if stream.peer_cred()?.uid() != expected_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "local administrative peer UID is not allowed",
+        ));
+    }
+    Ok(())
+}
+
 fn require_peer_uid(stream: &UnixStream, expected: u32) -> Result<(), ProtocolError> {
     let observed = peer_uid(stream)?;
     if observed != expected {
@@ -2948,6 +2967,27 @@ mod tests {
         quota.admit(true, 102).unwrap();
         drop(mutation);
         quota.admit(false, 103).unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_socket_checks_both_peers_against_kernel_identity() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        require_local_admin_peer(&client, uid).unwrap();
+        require_local_admin_peer(&server, uid).unwrap();
+        let foreign_uid = uid.wrapping_add(1);
+        assert_eq!(
+            require_local_admin_peer(&client, foreign_uid)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            require_local_admin_peer(&server, foreign_uid)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
