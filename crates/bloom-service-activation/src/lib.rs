@@ -94,6 +94,25 @@ pub fn take_tcp_listener(name: &str) -> Result<TcpListener, ActivationError> {
 /// the effective service UID with mode `0710`. Its group becomes the socket
 /// group. Existing live sockets and unsafe stale entries are rejected.
 pub fn bind_owned_unix_listener(path: &Path) -> Result<UnixListener, ActivationError> {
+    bind_unix_listener_with_modes(path, 0o710, 0o660)
+}
+
+/// Publish a private local listener for service-owned administration.
+///
+/// Reuses the authority listener's safe stale-socket and atomic-publication
+/// checks, but requires a service-owned `0700` directory and a `0600` socket.
+/// Callers must separately authenticate the peer with kernel credentials;
+/// filesystem access alone does not authorize an administrative operation.
+/// Existing authority edge directory requirements are not weakened.
+pub fn bind_private_unix_listener(path: &Path) -> Result<UnixListener, ActivationError> {
+    bind_unix_listener_with_modes(path, 0o700, 0o600)
+}
+
+fn bind_unix_listener_with_modes(
+    path: &Path,
+    directory_mode: u32,
+    socket_mode: u32,
+) -> Result<UnixListener, ActivationError> {
     if !path.is_absolute() || path.file_name().is_none() {
         return Err(ActivationError::Rejected(
             "owned Unix listener path must be an absolute file path".into(),
@@ -107,10 +126,10 @@ pub fn bind_owned_unix_listener(path: &Path) -> Result<UnixListener, ActivationE
     if !parent_metadata.file_type().is_dir()
         || parent_metadata.file_type().is_symlink()
         || parent_metadata.uid() != effective_uid
-        || parent_metadata.mode() & 0o777 != 0o710
+        || parent_metadata.mode() & 0o7777 != directory_mode
     {
         return Err(ActivationError::Rejected(format!(
-            "endpoint directory {} must be a non-symlink directory owned by effective UID {} with mode 0710",
+            "endpoint directory {} must be a non-symlink directory owned by effective UID {} with mode {directory_mode:04o}",
             parent.display(),
             effective_uid
         )));
@@ -131,12 +150,13 @@ pub fn bind_owned_unix_listener(path: &Path) -> Result<UnixListener, ActivationE
 
     let listener = UnixListener::bind(&temporary)?;
     let result = (|| {
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o660))?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(socket_mode))?;
         std::os::unix::fs::chown(&temporary, None, Some(parent_metadata.gid()))?;
         require_socket_metadata(
             &temporary,
             effective_uid,
             parent_metadata.gid(),
+            socket_mode,
             "new endpoint",
         )?;
         fs::rename(&temporary, path)?;
@@ -144,6 +164,7 @@ pub fn bind_owned_unix_listener(path: &Path) -> Result<UnixListener, ActivationE
             path,
             effective_uid,
             parent_metadata.gid(),
+            socket_mode,
             "published endpoint",
         )?;
         listener.set_nonblocking(true)?;
@@ -193,6 +214,7 @@ fn require_socket_metadata(
     path: &Path,
     uid: u32,
     gid: u32,
+    mode: u32,
     description: &str,
 ) -> Result<(), ActivationError> {
     let metadata = fs::symlink_metadata(path)?;
@@ -200,7 +222,7 @@ fn require_socket_metadata(
         || metadata.file_type().is_symlink()
         || metadata.uid() != uid
         || metadata.gid() != gid
-        || metadata.mode() & 0o777 != 0o660
+        || metadata.mode() & 0o7777 != mode
         || metadata.nlink() != 1
     {
         return Err(ActivationError::Rejected(format!(
@@ -399,6 +421,29 @@ mod tests {
             Some(rpc_path.as_path())
         );
         assert!(activation.take("signer").is_err());
+    }
+
+    #[test]
+    fn private_listener_requires_private_directory_and_reuses_safe_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("admin.sock");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o710)).unwrap();
+        assert!(bind_private_unix_listener(&socket_path).is_err());
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(bind_owned_unix_listener(&socket_path).is_err());
+        let listener = bind_private_unix_listener(&socket_path).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&socket_path).unwrap().mode() & 0o7777,
+            0o600
+        );
+        assert!(bind_private_unix_listener(&socket_path).is_err());
+        drop(listener);
+        let listener = bind_private_unix_listener(&socket_path).unwrap();
+        drop(listener);
+        fs::remove_file(&socket_path).unwrap();
+        fs::write(&socket_path, b"not a socket").unwrap();
+        assert!(bind_private_unix_listener(&socket_path).is_err());
+        assert_eq!(fs::read(&socket_path).unwrap(), b"not a socket");
     }
 
     #[test]
