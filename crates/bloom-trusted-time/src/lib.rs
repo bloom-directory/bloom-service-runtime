@@ -161,7 +161,12 @@ pub fn evaluate_durable_clock(
         });
     }
     Ok(DurableClockDecision {
-        effective_now_ms: utc_ms.max(monotonic_now),
+        // The monotonic estimate bounds forward jumps; it is not a UTC
+        // observation. Persisting it as the floor can put the floor ahead of
+        // wall time after clock slewing or fractional-millisecond rounding,
+        // causing the next request to report a rollback that never happened.
+        // The rollback check above already ensures this floor never decreases.
+        effective_now_ms: utc_ms,
         condition: DurableClockCondition::Healthy,
     })
 }
@@ -360,6 +365,39 @@ fn timespec_ns(seconds: libc::time_t, nanoseconds: libc::c_long) -> Result<u64, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slower_wall_clock_does_not_poison_the_next_burst() {
+        let mut previous = Some(super::PersistedClockState {
+            last_effective_ms: 10_000,
+            monotonic_anchor_ns: 1_000_000_000,
+            boot_epoch: Some(EPOCH_A),
+        });
+        for (utc_ms, anchor, elapsed) in [
+            (10_001, 1_002_000_000, 2),
+            (10_001, 1_002_100_000, 0),
+            (10_002, 1_003_000_000, 1),
+        ] {
+            let decision = evaluate_durable_clock(
+                previous,
+                &PlatformTimeReading {
+                    utc_ms: Some(utc_ms),
+                    monotonic_anchor_ns: anchor,
+                    monotonic_elapsed_ms: elapsed,
+                },
+                Some(EPOCH_A),
+                MAX_FORWARD_STEP_MS,
+            )
+            .unwrap();
+            assert_eq!(decision.condition, DurableClockCondition::Healthy);
+            assert_eq!(decision.effective_now_ms, utc_ms);
+            previous = Some(PersistedClockState {
+                last_effective_ms: decision.effective_now_ms,
+                monotonic_anchor_ns: anchor,
+                boot_epoch: Some(EPOCH_A),
+            });
+        }
+    }
+
     /// Two distinct monotonic domains, standing in for two boots.
     const EPOCH_A: [u8; 16] = [0xa1; 16];
     const EPOCH_B: [u8; 16] = [0xb2; 16];
